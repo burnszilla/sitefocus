@@ -32,7 +32,7 @@ pip install "git+https://github.com/burnszilla/sitefocus"
 Or from a release wheel (no network to GitHub needed): download it from the Releases page, then
 
 ```
-pip install sitefocus-1.5.1-py3-none-any.whl
+pip install sitefocus-1.5.2-py3-none-any.whl
 ```
 
 Ollama and one embedding model (about 270 MB):
@@ -169,3 +169,7 @@ python -m unittest discover -s tests -v
 ## Claude Code
 
 The `skill/` folder (in this repo and in the release zip) is a Claude Code skill. Copy it to `~/.claude/skills/site-focus/` and Claude will run sitefocus for you.
+
+## License
+
+MIT, see [LICENSE](LICENSE). Use it, change it and share it, commercially too; keep the copyright notice. No warranty.
