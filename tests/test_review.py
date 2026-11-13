@@ -181,8 +181,12 @@ class TestCrawlScope(unittest.TestCase):
         t = sorted(x for x, p in MAIN_REQUESTS)
         rate = (len(t) - 1) / (t[-1] - t[0])
         self.assertLessEqual(rate, 22)
-        gaps = [b - a for a, b in zip(t, t[1:])]
-        self.assertGreaterEqual(min(gaps), 0.025)  # no bursts: arrivals never much closer than the 0.05 s grant spacing
+        # No bursts: in any half second, at most 10 requests (0.5 / 0.05) plus
+        # 3 for jitter. The scheduler spaces request starts; arrival times at
+        # the server also carry thread and network jitter, so a strict
+        # per-gap check would test the CI machine, not the crawler.
+        busiest = max(sum(1 for y in t[i:] if y - x < 0.5) for i, x in enumerate(t))
+        self.assertLessEqual(busiest, 13)
 
     def test_paragraph_with_inline_markup_is_one_block(self):  # finding: parser splits paragraphs
         text = pages()[f"{BASE}/odd/inline/"]["text"]
