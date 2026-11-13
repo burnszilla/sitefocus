@@ -32,7 +32,7 @@ pip install "git+https://github.com/burnszilla/sitefocus"
 Or from a release wheel (no network to GitHub needed): download it from the Releases page, then
 
 ```
-pip install sitefocus-1.4.1-py3-none-any.whl
+pip install sitefocus-1.4.2-py3-none-any.whl
 ```
 
 Ollama and one embedding model (about 270 MB):

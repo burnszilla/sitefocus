@@ -99,21 +99,19 @@ class TestCrawlScope(unittest.TestCase):
 
     def test_scheduler_spaces_workers(self):  # finding: per-worker throttling
         gate = mod("site_crawl").Gate(0.05)
-        times, lock = [], threading.Lock()
 
         def worker():
             for _ in range(5):
                 gate.wait()
-                with lock:
-                    times.append(time.time())
         ts = [threading.Thread(target=worker) for _ in range(3)]
         for t in ts:
             t.start()
         for t in ts:
             t.join()
-        times.sort()
+        times = sorted(gate.granted)
+        self.assertEqual(len(times), 15)
         gaps = [b - a for a, b in zip(times, times[1:])]
-        self.assertGreaterEqual(min(gaps), 0.045)  # released one at a time, 0.05 s apart
+        self.assertGreaterEqual(min(gaps), 0.05 - 1e-6)  # never two grants closer than the interval
 
     def test_crawl_rate_is_limited(self):  # end to end: 0.05 s schedule means at most ~20 requests a second
         t = sorted(x for x, p in MAIN_REQUESTS)

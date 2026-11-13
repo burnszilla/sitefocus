@@ -199,24 +199,32 @@ def same_site(u, origin):
 
 
 class Gate:
-    """One request schedule for the whole site, shared by all workers."""
+    """One request schedule for the whole site, shared by all workers. A
+    worker is let through only when at least `interval` seconds have passed
+    since the previous one was, so a worker that oversleeps can never fire
+    right behind another."""
 
     def __init__(self, interval):
         self.interval = interval
         self.next = 0.0
         self.lock = threading.Lock()
+        self.granted = []  # grant times, for tests
 
     def wait(self):
-        with self.lock:
-            now = time.time()
-            t = max(now, self.next)
-            self.next = t + self.interval
-        if t > now:
-            time.sleep(t - now)
+        while True:
+            with self.lock:
+                now = time.monotonic()
+                if now >= self.next:
+                    self.next = now + self.interval
+                    if len(self.granted) < 10000:
+                        self.granted.append(now)
+                    return
+                delay = self.next - now
+            time.sleep(delay)
 
     def cool(self, seconds):
         with self.lock:
-            self.next = max(self.next, time.time() + seconds)
+            self.next = max(self.next, time.monotonic() + seconds)
 
 
 def _retry_after(headers, default):
