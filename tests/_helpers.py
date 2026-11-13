@@ -1,6 +1,8 @@
 """Find the sitefocus modules whether the tests run from the skill folder
 (../scripts) or against the installed package (import sitefocus)."""
+import csv
 import importlib
+import json
 import os
 import sys
 
@@ -28,3 +30,23 @@ def run(name, args):
         return m.main()
     finally:
         sys.argv = old
+
+
+def jload(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def rcsv(path):
+    with open(path, newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def rtext(path):
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+def wtext(path, text):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)

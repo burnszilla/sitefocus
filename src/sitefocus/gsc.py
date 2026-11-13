@@ -37,9 +37,9 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 try:
-    from .common import write_private
+    from .common import load_json, write_private
 except ImportError:
-    from common import write_private
+    from common import load_json, write_private
 
 SCOPE = "https://www.googleapis.com/auth/webmasters.readonly"
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -62,10 +62,22 @@ Connect (read-only) in one of two ways:
 """
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Google's token and API endpoints never redirect; a redirect is refused
+    so a token or bearer header can never be sent to another address."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, f"redirect to {newurl} refused (credentials are never forwarded)",
+                                     headers, fp)
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def _post_form(url, data):
     req = urllib.request.Request(url, data=urllib.parse.urlencode(data).encode(),
                                  headers={"Content-Type": "application/x-www-form-urlencoded"})
-    with urllib.request.urlopen(req, timeout=60) as r:
+    with _OPENER.open(req, timeout=60) as r:
         return json.load(r)
 
 
@@ -74,9 +86,12 @@ def _api(method, path, token, body=None):
                                  data=json.dumps(body).encode() if body is not None else None,
                                  headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=120) as r:
+        with _OPENER.open(req, timeout=120) as r:
             return json.load(r)
     except urllib.error.HTTPError as ex:
+        if 300 <= ex.code < 400:
+            ex.close()
+            raise SystemExit(f"Search Console API answered {ex.code} with a redirect for {path}; refused, credentials are never forwarded")
         detail = ex.read().decode("utf-8", "replace")[:300]
         ex.close()
         raise SystemExit(f"Search Console API {ex.code} for {path}: {detail}")
@@ -87,7 +102,7 @@ def credentials():
     for path, src in ((STORE, "sitefocus"), (ADC, "gcloud")):
         if os.path.exists(path):
             try:
-                d = json.load(open(path))
+                d = load_json(path)
             except Exception:
                 continue
             if d.get("refresh_token") and d.get("client_id") and d.get("client_secret"):
@@ -112,7 +127,7 @@ def access_token(creds=None):
 
 
 def login(client_secret_path, open_browser=True, timeout=300):
-    d = json.load(open(client_secret_path))
+    d = load_json(client_secret_path)
     d = d.get("installed") or d.get("web") or d
     cid, csec = d["client_id"], d["client_secret"]
     verifier = base64.urlsafe_b64encode(secrets.token_bytes(48)).rstrip(b"=").decode()

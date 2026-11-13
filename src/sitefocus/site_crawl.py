@@ -33,9 +33,11 @@ Writes:
 import argparse
 import codecs
 import csv
+import email.message
 import email.utils
 import gzip
 import json
+import math
 import os
 import re
 import shutil
@@ -56,10 +58,15 @@ except ImportError:
 
 _CONTACT = os.environ.get("SITEFOCUS_CONTACT") or os.environ.get("CCRA_CONTACT")
 UA = "Mozilla/5.0 (compatible; sitefocus/1.0" + (f"; +mailto:{_CONTACT}" if _CONTACT else "") + ")"
+# The product token robots.txt groups are matched against ("User-agent:
+# sitefocus"). The HTTP header above starts with Mozilla for compatibility;
+# matching robots.txt on that would apply rules meant for "Mozilla" instead.
+TOKEN = "sitefocus"
 BACKOFF = float(os.environ.get("SITEFOCUS_BACKOFF", "30"))  # seconds; first wait after a 429 or 503
 MAX_BYTES = 5 * 1024 * 1024        # largest response body read
 MAX_INFLATED = 20 * 1024 * 1024    # largest decompressed body
 MAX_SITEMAP_FILES = 200
+MAX_CRAWL_DELAY = 600              # seconds; a robots.txt asking for more stops the crawl
 SKIP_EXT = re.compile(r"\.(pdf|jpe?g|png|gif|svg|webp|avif|zip|gz|mp4|mp3|css|js|xml|ico|woff2?|ttf|xlsx?|docx?|pptx?)$", re.I)
 ZONE_TAGS = {"nav": "nav", "header": "header", "footer": "footer"}
 ZONE_HINT = re.compile(r"(^|[-_ ])(nav|navbar|menu|megamenu|header|footer|breadcrumb)", re.I)
@@ -76,6 +83,13 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 _OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def _join(base, href):
+    try:
+        return urljoin(base, href.strip())
+    except ValueError:
+        return None
 
 
 class Page(HTMLParser):
@@ -112,7 +126,7 @@ class Page(HTMLParser):
         if tag in BLOCK_TAGS:
             self._flush()
         if tag == "base" and a.get("href") and not self._base_set:
-            self.base = urljoin(self.base, a["href"])
+            self.base = _join(self.base, a["href"]) or self.base
             self._base_set = True
         z = ZONE_TAGS.get(tag)
         if not z:
@@ -124,12 +138,15 @@ class Page(HTMLParser):
                 z = "nav"
         if tag not in VOID:
             self.stack.append((tag, z))
-        if tag == "meta" and (a.get("name") or "").lower() == "robots":
-            self.robots = a.get("content") or ""
+        if tag == "meta" and (a.get("name") or "").lower() == "robots" and a.get("content"):
+            # Several robots tags combine; a later "follow" never cancels an earlier "noindex".
+            self.robots = ", ".join(x for x in (self.robots, a["content"]) if x)
         if tag == "link" and "canonical" in (a.get("rel") or "").lower().split():
-            self.canonical = urljoin(self.base, a.get("href") or "")
+            self.canonical = _join(self.base, a.get("href") or "") or ""
         if tag == "a" and a.get("href"):
-            self._a = [urljoin(self.base, a["href"]), self.zone(), [], (a.get("rel") or "")]
+            href = _join(self.base, a["href"])
+            if href:
+                self._a = [href, self.zone(), [], (a.get("rel") or "")]
         if tag in self._in:
             self._in[tag] = True
         self._buf_zone = self.zone()
@@ -170,29 +187,50 @@ class Page(HTMLParser):
         self._flush()
 
 
+def _netloc(p):
+    host = p.hostname.lower()
+    if ":" in host:  # IPv6 literal
+        host = f"[{host}]"
+    port = p.port
+    if port and port != {"http": 80, "https": 443}[p.scheme.lower()]:
+        host += f":{port}"
+    return host
+
+
 def norm(u, keep_query=False):
     """Absolute http(s) URL without fragment, lower-case scheme and host, '/'
     for an empty path. Without keep_query the query string is dropped, so
-    ?sort= and ?page= variants collapse into one URL."""
-    u = urldefrag(u.strip())[0]
-    p = urlsplit(u)
-    if p.scheme.lower() not in ("http", "https") or not p.hostname:
+    ?sort= and ?page= variants collapse into one URL. Returns None for
+    anything that is not a well-formed http(s) URL (bad port, bad IPv6)."""
+    try:
+        u = urldefrag(u.strip())[0]
+        p = urlsplit(u)
+        if p.scheme.lower() not in ("http", "https") or not p.hostname:
+            return None
+        return urlunsplit((p.scheme.lower(), _netloc(p), p.path or "/", p.query if keep_query else "", ""))
+    except ValueError:
         return None
-    netloc = p.hostname.lower() + (f":{p.port}" if p.port and p.port != {"http": 80, "https": 443}[p.scheme.lower()] else "")
-    return urlunsplit((p.scheme.lower(), netloc, p.path or "/", p.query if keep_query else "", ""))
 
 
 def origin_of(u):
     p = urlsplit(u)
-    return (p.hostname or "").lower(), (p.port or {"http": 80, "https": 443}.get(p.scheme.lower(), 0))
+    try:
+        port = p.port
+    except ValueError:
+        port = None
+    return (p.hostname or "").lower(), (port or {"http": 80, "https": 443}.get(p.scheme.lower(), 0))
 
 
 def same_site(u, origin):
-    """Same host and port as the crawl origin; http and https both count."""
-    p = urlsplit(u)
-    if p.scheme.lower() not in ("http", "https") or not p.hostname:
+    """Same host and port as the crawl origin. http and https both count, so
+    ports 80 and 443 are treated as one site; any other port must match."""
+    try:
+        p = urlsplit(u)
+        if p.scheme.lower() not in ("http", "https") or not p.hostname:
+            return False
+        port = p.port or {"http": 80, "https": 443}[p.scheme.lower()]
+    except ValueError:
         return False
-    port = p.port or {"http": 80, "https": 443}[p.scheme.lower()]
     host, oport = origin
     default = {80, 443}
     return p.hostname.lower() == host and (port == oport or (port in default and oport in default))
@@ -209,6 +247,7 @@ class Gate:
         self.next = 0.0
         self.lock = threading.Lock()
         self.granted = []  # grant times, for tests
+        self.cools = []    # cooldowns applied, for tests
 
     def wait(self):
         while True:
@@ -224,11 +263,12 @@ class Gate:
 
     def cool(self, seconds):
         with self.lock:
+            self.cools.append(seconds)
             self.next = max(self.next, time.monotonic() + seconds)
 
 
 def _retry_after(headers, default):
-    v = (headers or {}).get("Retry-After") if headers else None
+    v = headers.get("Retry-After") if headers else None
     if not v:
         return default
     try:
@@ -257,10 +297,18 @@ def _read_body(r):
 
 
 def _charset(ctype, raw):
-    m = re.search(r"charset=([\w.:-]+)", ctype or "", re.I)
-    cs = m.group(1) if m else None
+    """Charset from the Content-Type header (quoted or not), else from a meta
+    tag in the first 4 KB, else UTF-8."""
+    cs = None
+    if ctype:
+        m = email.message.Message()
+        m["content-type"] = ctype
+        cs = m.get_param("charset")
+        if isinstance(cs, tuple):  # RFC 2231 form
+            cs = cs[2]
+        cs = (cs or "").strip().strip("\"'") or None
     if not cs:
-        m = re.search(rb"<meta[^>]+charset=[\"']?([\w.:-]+)", raw[:4096], re.I)
+        m = re.search(rb"<meta[^>]+charset\s*=\s*[\"']?\s*([\w.:-]+)", raw[:4096], re.I)
         cs = m.group(1).decode("ascii", "ignore") if m else "utf-8"
     try:
         codecs.lookup(cs)
@@ -269,129 +317,309 @@ def _charset(ctype, raw):
     return cs
 
 
-def fetch(u, origin, rp, gate, max_hops=5, check=True):
-    """GET u, following redirects only while each hop stays on the crawl
-    origin and is allowed by robots.txt. Returns (record, body, ctype)."""
-    rec = {"url": u}
+class Response:
+    """What one request ended with. resp is an open response for a 2xx
+    (caller closes it), else None."""
+
+    def __init__(self, url):
+        self.url = url
+        self.status = 0
+        self.headers = None
+        self.resp = None
+        self.redirects = []
+        self.exhausted = False  # ran out of redirect hops
+        self.blocked = None   # URL a redirect pointed to that the policy refused
+        self.reason = None    # why it was refused
+        self.error = None
+
+
+def request(u, gate, allow, max_hops=5, accept="text/html,application/xhtml+xml", timeout=40, tries=3,
+            retry_codes=(429, 503)):
+    """The one way sitefocus talks to a site. GET u through the shared gate,
+    following redirects by hand: allow(url) is called for u and for every
+    redirect target BEFORE it is requested and returns None (go) or a reason
+    (refuse). Every 429 or 503 cools the whole gate, honouring Retry-After,
+    including the last one."""
+    out = Response(u)
     cur = u
-    for hop in range(max_hops + 1):
-        if check and (not same_site(cur, origin) or not rp.can_fetch(UA, cur)):
-            rec["status"] = rec.get("status", 0)
-            rec["blocked_redirect"] = cur
-            return rec, b"", ""
-        for attempt in range(3):
+    for _ in range(max_hops + 1):
+        why = allow(cur)
+        if why:
+            out.blocked, out.reason = cur, why
+            return out
+        for attempt in range(tries):
             gate.wait()
             try:
-                req = urllib.request.Request(cur, headers={"User-Agent": UA, "Accept": "text/html,application/xhtml+xml",
-                                                           "Accept-Encoding": "gzip"})
-                r = _OPENER.open(req, timeout=40)
-                rec["status"] = r.status
-                rec["final"] = norm(cur, True) or cur
-                rec["x_robots"] = (r.headers.get("X-Robots-Tag") or "").lower()
-                ctype = r.headers.get("Content-Type", "")
-                if "html" not in ctype.lower():
-                    r.close()
-                    return rec, b"", ctype
-                body, truncated = _read_body(r)
-                r.close()
-                if truncated:
-                    rec["truncated"] = True
-                return rec, body, ctype
+                req = urllib.request.Request(cur, headers={"User-Agent": UA, "Accept": accept, "Accept-Encoding": "gzip"})
+                r = _OPENER.open(req, timeout=timeout)
+                out.url, out.status, out.headers, out.resp = cur, r.status, r.headers, r
+                return out
             except urllib.error.HTTPError as ex:
                 code, hdrs = ex.code, ex.headers
                 ex.close()
+                out.url, out.status, out.headers = cur, code, hdrs
                 if 300 <= code < 400 and hdrs and hdrs.get("Location"):
-                    nxt = urljoin(cur, hdrs["Location"])
-                    rec.setdefault("redirects", []).append([code, nxt])
+                    try:
+                        nxt = urljoin(cur, hdrs["Location"])
+                    except ValueError:
+                        out.error = "bad redirect location"
+                        return out
+                    out.redirects.append([code, nxt])
                     cur = nxt
                     break
-                rec["status"] = code
-                if code in (429, 503) and attempt < 2:
+                if code in retry_codes:
                     gate.cool(_retry_after(hdrs, BACKOFF * (attempt + 1)))
-                    continue
-                return rec, b"", ""
+                    if attempt < tries - 1:
+                        continue
+                return out
             except Exception as ex:
-                rec["error"] = str(ex)[:200]
-                return rec, b"", ""
+                # A transport failure leaves no status: an earlier hop's 3xx
+                # says nothing about whether the final fetch worked.
+                out.url, out.status, out.error = cur, 0, str(ex)[:200]
+                return out
         else:
-            return rec, b"", ""
-    rec["error"] = "too many redirects"
-    return rec, b"", ""
+            return out
+    out.error, out.exhausted = "too many redirects", True
+    return out
+
+
+def _allows(robots, u):
+    """robots is a Robots (rules per origin) or a single RobotFileParser."""
+    if hasattr(robots, "allows"):
+        return robots.allows(u)
+    return robots.can_fetch(TOKEN, u)
+
+
+class Robots:
+    """robots.txt rules per origin (scheme, host, port), each fetched once
+    before the first request to that origin. Thread-safe. For origins marked
+    strict a robots.txt that cannot be read stops the crawl; for any other
+    origin it means nothing there is fetched."""
+
+    def __init__(self, gate, delay=0.0):
+        self.gate, self.delay = gate, delay
+        self.cache, self.lock = {}, threading.RLock()
+
+    @staticmethod
+    def key(u):
+        host, port = origin_of(u)
+        return urlsplit(u).scheme.lower(), host, port
+
+    def entry(self, u, strict=False):
+        k = self.key(u)
+        with self.lock:
+            if k not in self.cache:
+                try:
+                    self.cache[k] = load_robots(u, self.gate)
+                except SystemExit as ex:
+                    if strict:
+                        raise
+                    rp = urllib.robotparser.RobotFileParser()
+                    rp.parse(["User-agent: *", "Disallow: /"])
+                    print(f"warning: robots.txt for {k[0]}://{k[1]}:{k[2]} unreadable ({str(ex)[:120]}); nothing fetched there", flush=True)
+                    self.cache[k] = (rp, "unreadable", None)
+                cd = self.cache[k][2]
+                if cd and cd > MAX_CRAWL_DELAY:
+                    msg = (f"robots.txt for {k[1]} asks for {cd:g} s between requests; above {MAX_CRAWL_DELAY} s "
+                           "a crawl is impractical, so nothing is fetched there")
+                    if strict:
+                        raise SystemExit(msg.replace("nothing is fetched there", "stopping"))
+                    print("warning: " + msg, flush=True)
+                    rp = urllib.robotparser.RobotFileParser()
+                    rp.parse(["User-agent: *", "Disallow: /"])
+                    self.cache[k] = (rp, "crawl-delay too long", None)
+                elif cd:
+                    self.gate.interval = max(self.gate.interval, self.delay, float(cd))
+            return self.cache[k]
+
+    def parser(self, u, strict=False):
+        return self.entry(u, strict)[0]
+
+    def allows(self, u):
+        return self.parser(u).can_fetch(TOKEN, u)
+
+
+def site_policy(origin, robots):
+    """Allow only URLs on the crawl origin that their own robots.txt (http and
+    https are read separately) allows."""
+    def allow(u):
+        if not same_site(u, origin):
+            return "off-site"
+        if not _allows(robots, u):
+            return "robots.txt"
+        return None
+    return allow
+
+
+def fetch(u, origin, robots, gate, max_hops=5):
+    """GET a page. Redirects are followed only while each hop stays on the
+    crawl origin and is allowed by robots.txt. Returns (record, body, ctype)."""
+    rec = {"url": u}
+    res = request(u, gate, site_policy(origin, robots), max_hops)
+    rec["status"] = res.status
+    if res.redirects:
+        rec["redirects"] = res.redirects
+    if res.blocked:
+        rec["blocked_redirect"] = res.blocked
+        return rec, b"", ""
+    if res.error:
+        rec["error"] = res.error
+    if not res.resp:
+        return rec, b"", ""
+    r = res.resp
+    rec["final"] = norm(res.url, True) or res.url
+    rec["x_robots"] = ", ".join(r.headers.get_all("X-Robots-Tag") or []).lower()
+    ctype = r.headers.get("Content-Type", "")
+    if "html" not in ctype.lower():
+        r.close()
+        return rec, b"", ctype
+    try:
+        body, truncated = _read_body(r)
+    except Exception as ex:
+        rec["error"] = str(ex)[:200]
+        return rec, b"", ""
+    finally:
+        r.close()
+    if truncated:
+        rec["truncated"] = True
+    return rec, body, ctype
+
+
+def crawl_delay(lines, token=TOKEN):
+    """Crawl-delay for our group (else the * group), decimals allowed
+    (Python's robotparser only reads whole numbers)."""
+    groups, agents, in_rules = [], [], False
+    for line in lines:
+        line = line.split("#", 1)[0].strip()
+        if ":" not in line:
+            continue
+        k, v = (x.strip() for x in line.split(":", 1))
+        k = k.lower()
+        if k == "user-agent":
+            if in_rules:
+                agents, in_rules = [], False
+            if not agents:
+                groups.append((agents, {}))
+            agents.append(v.lower())
+        elif groups:
+            in_rules = True
+            if k == "crawl-delay":
+                try:
+                    d = float(v)
+                except ValueError:
+                    continue
+                if math.isfinite(d) and d >= 0:  # "1e309", "nan" and negatives are ignored
+                    groups[-1][1]["delay"] = d
+    mine = [g for a_, g in groups if any(x != "*" and x in token for x in a_)]
+    star = [g for a_, g in groups if "*" in a_]
+    for g in mine or star:
+        if "delay" in g:
+            return g["delay"]
+    return None
 
 
 def load_robots(start, gate):
-    """Fetch and parse robots.txt. Returns (parser, status, crawl_delay)."""
+    """Fetch and parse robots.txt for the start URL's host. Returns (parser,
+    status, crawl_delay). Redirects are followed only on the same host; a
+    redirect elsewhere is not followed and counts as no robots.txt (RFC 9309
+    treats an unreachable file like a 4xx)."""
     p = urlsplit(start)
     url = f"{p.scheme}://{p.netloc}/robots.txt"
+    origin = origin_of(url)
     rp = urllib.robotparser.RobotFileParser()
-    for attempt in range(3):
-        gate.wait()
+    res = request(url, gate, lambda u: None if same_site(u, origin) else "off-site", accept="text/plain,*/*",
+                  retry_codes=(429,) + tuple(range(500, 600)))
+    if res.blocked:
+        rp.parse([])
+        return rp, "redirect-offsite", None
+    if res.resp:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": UA})
-            with urllib.request.urlopen(req, timeout=30) as r:
-                raw, _ = _read_body(r)
-                rp.parse(raw.decode("utf-8", "replace").splitlines())
-                return rp, r.status, rp.crawl_delay(UA)
-        except urllib.error.HTTPError as ex:
-            code, hdrs = ex.code, ex.headers
-            ex.close()
-            if code in (404, 410):
-                rp.parse([])
-                return rp, code, None
-            if code in (401, 403):
-                raise SystemExit(f"robots.txt returned {code} for this crawler; the site is blocking it. Stopping.")
-            if attempt < 2:
-                gate.cool(_retry_after(hdrs, BACKOFF * (attempt + 1)))
-                continue
-            raise SystemExit(f"robots.txt returned {code} three times; not crawling a site whose rules cannot be read. Try again later.")
-        except urllib.error.URLError as ex:
-            raise SystemExit(f"could not fetch {url}: {ex.reason}")
-    raise SystemExit(f"could not read {url}")
+            raw, _ = _read_body(res.resp)
+        finally:
+            res.resp.close()
+        lines = raw.decode("utf-8", "replace").splitlines()
+        rp.parse(lines)
+        return rp, res.status, crawl_delay(lines)
+    code = res.status
+    if res.exhausted:  # RFC 9309: more than five redirects, treat as unavailable
+        rp.parse([])
+        return rp, "too-many-redirects", None
+    if res.error:
+        raise SystemExit(f"could not fetch {res.url}: {res.error}")
+    if code in (401, 403):
+        raise SystemExit(f"robots.txt returned {code} for this crawler; the site is blocking it. Stopping.")
+    if 400 <= code < 500 and code != 429:
+        rp.parse([])
+        return rp, code, None
+    raise SystemExit(f"robots.txt returned {code} three times; not crawling a site whose rules cannot be read. Try again later.")
 
 
-def resolve_start(start, gate):
+def resolve_start(start, gate, robots):
     """Follow the start URL's redirects (any host, at most 5 hops) to find the
-    site's real origin."""
-    cur = start
-    for _ in range(6):
-        gate.wait()
+    site's real origin. Before each hop is requested, robots.txt for that
+    hop's host is loaded (robots(url) returns its parser) and must allow it.
+    Returns the final URL."""
+    def allow(u):
+        if norm(u) is None:
+            return "not an http(s) URL"
+        return None if robots(u).can_fetch(TOKEN, u) else "robots.txt"
+    res = request(start, gate, allow)
+    if res.resp:
+        res.resp.close()
+    if res.blocked:
+        raise SystemExit(f"the start URL redirects to {res.blocked}, which is not allowed ({res.reason}). Stopping.")
+    if res.status in (429, 503) or (not res.resp and res.status >= 500):
+        raise SystemExit(f"the start URL {res.url} returned {res.status}; the site is unavailable or rate-limiting. Try again later.")
+    if res.error and not res.status:
+        raise SystemExit(f"could not fetch the start URL {start}: {res.error}")
+    return norm(res.url, True) or res.url
+
+
+def sitemap_policy(origin, robots, roots):
+    """A sitemap may be on the crawl origin or on the exact origin (host and
+    port) of a sitemap you supplied; either way its own robots.txt must
+    allow it (with a single parser, only the crawl origin can be checked, so
+    other origins are refused)."""
+    def allow(u):
         try:
-            req = urllib.request.Request(cur, headers={"User-Agent": UA, "Accept": "text/html"})
-            r = _OPENER.open(req, timeout=40)
-            r.close()
-            return norm(cur, True) or cur
-        except urllib.error.HTTPError as ex:
-            code, hdrs = ex.code, ex.headers
-            ex.close()
-            if 300 <= code < 400 and hdrs and hdrs.get("Location"):
-                cur = urljoin(cur, hdrs["Location"])
-                continue
-            return norm(cur, True) or cur
-        except Exception:
-            return norm(cur, True) or cur
-    return norm(cur, True) or cur
+            p = urlsplit(u)
+            ok = p.scheme.lower() in ("http", "https") and (same_site(u, origin) or origin_of(u) in roots)
+        except ValueError:
+            ok = False
+        if not ok:
+            return "off-site"
+        if not hasattr(robots, "allows") and not same_site(u, origin):
+            return "no robots.txt for that origin"
+        return None if _allows(robots, u) else "robots.txt"
+    return allow
 
 
-def sitemap_urls(url, origin, rp, gate, limit, roots, seen=None, depth=0):
-    """URLs from a sitemap or sitemap index. Nested sitemaps are fetched only
-    on the same host as a sitemap you supplied, or the crawl origin."""
+def sitemap_urls(url, origin, robots, gate, limit, roots, seen=None, depth=0):
+    """URLs from a sitemap or sitemap index. Every fetch, nested sitemaps and
+    redirect hops included, must pass sitemap_policy."""
     seen = seen if seen is not None else set()
     if url in seen or len(seen) >= MAX_SITEMAP_FILES or depth > 3:
         return []
     seen.add(url)
-    host = urlsplit(url).hostname
-    if not (same_site(url, origin) or host in roots):
+    res = request(url, gate, sitemap_policy(origin, robots, roots), accept="application/xml,text/xml,*/*", timeout=60)
+    if res.blocked:
+        if depth == 0:
+            raise ValueError(f"not fetched: {res.blocked} ({res.reason})")
         return []
-    gate.wait()
-    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Encoding": "gzip"})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        body, _ = _read_body(r)
+    if not res.resp:
+        if depth == 0:
+            raise ValueError(res.error or f"HTTP {res.status}")
+        return []
+    try:
+        body, _ = _read_body(res.resp)
+    finally:
+        res.resp.close()
     out = []
     is_index = b"<sitemapindex" in body[:4000]
     for l in re.findall(rb"<loc>\s*([^<\s]+)\s*</loc>", body):
         l = l.decode("utf-8", "replace").replace("&amp;", "&")
         if is_index:
-            out += sitemap_urls(l, origin, rp, gate, limit - len(out), roots, seen, depth + 1)
+            out += sitemap_urls(l, origin, robots, gate, limit - len(out), roots, seen, depth + 1)
         else:
             out.append(l)
         if len(out) >= limit:
@@ -425,29 +653,30 @@ def main():
     start = norm(a.start, True)
     if not start:
         raise SystemExit(f"--start must be an http(s) URL: {a.start}")
-    # robots.txt comes before any page request, for the start host and, if
-    # the start URL redirects elsewhere, for the host it lands on.
-    rp, robots_status, cdelay = load_robots(start, gate)
-    if not rp.can_fetch(UA, start):
+    # robots.txt comes before any page request: for the start host, and for
+    # every host a start redirect points to, before that hop is requested.
+    robots = Robots(gate, a.delay)
+    robots_for = lambda u: robots.parser(u, strict=True)  # start hops: unreadable rules stop the run
+
+    if not robots_for(start).can_fetch(TOKEN, start):
         raise SystemExit(f"robots.txt disallows the start URL {start} for this crawler. Stopping.")
-    gate.interval = max(a.delay, float(cdelay or 0))
-    final_start = resolve_start(start, gate)
+    final_start = resolve_start(start, gate, robots_for)
     origin = origin_of(final_start)
     if origin_of(start) != origin:
         print(f"start URL redirects to {final_start}; crawling {origin[0]}", flush=True)
-        rp, robots_status, cdelay = load_robots(final_start, gate)
+    rp, robots_status, cdelay = robots.entry(final_start, strict=True)
     gate.interval = max(a.delay, float(cdelay or 0))
     if cdelay:
         print(f"robots.txt Crawl-delay {cdelay}s: one request every {gate.interval:g}s", flush=True)
     with open(os.path.join(a.out, "meta.json"), "w") as f:
         json.dump({"start": start, "start_final": final_start, "origin_host": origin[0], "origin_port": origin[1],
                    "robots_status": robots_status, "crawl_delay": cdelay, "interval": gate.interval,
-                   "keep_query": a.keep_query, "user_agent": UA}, f, indent=1)
+                   "keep_query": a.keep_query, "user_agent": UA, "robots_token": TOKEN}, f, indent=1)
 
     if repair_jsonl_tail(pages_path):
         print("repaired a partial last line in pages.jsonl (kept in pages.jsonl.damaged)", flush=True)
     previous = read_pages(pages_path)
-    retry = lambda r: r.get("error") or r.get("status") in (0, 429, 500, 502, 503, 504) or (r.get("status") is None)
+    retry = lambda r: bool(r.get("error")) or r.get("status") in (0, 429, None) or (r.get("status") or 0) >= 500
     done = {r["url"] for r in previous if not retry(r)}
 
     queue, queued = deque(), set()
@@ -456,16 +685,16 @@ def main():
     def push(u):
         u = norm(u, a.keep_query)
         if (not u or u in queued or len(queued) >= frontier_cap or not same_site(u, origin)
-                or SKIP_EXT.search(urlsplit(u).path) or not rp.can_fetch(UA, u)):
+                or SKIP_EXT.search(urlsplit(u).path) or not robots.allows(u)):
             return
         queued.add(u)
         queue.append(u)
 
     push(final_start)
-    roots = {origin[0]} | {urlsplit(s).hostname for s in a.sitemap}
+    roots = {origin_of(s) for s in a.sitemap if norm(s)}
     for sm in a.sitemap:
         try:
-            got = sitemap_urls(sm, origin, rp, gate, 5 * a.max_pages, roots)
+            got = sitemap_urls(sm, origin, robots, gate, 5 * a.max_pages, roots)
         except Exception as ex:
             print(f"warning: sitemap {sm} could not be read ({ex}); continuing without it", flush=True)
             continue
@@ -473,6 +702,8 @@ def main():
         for u in got:
             push(u)
     for r in previous:
+        if retry(r):  # failed last time: try it again
+            push(r["url"])
         for l in r.get("links", []):
             push(l[0])
 
@@ -480,7 +711,16 @@ def main():
     out = open(pages_path, "a")
     count = [len(done)]
 
+    failures = []
+
     def worker():
+        try:
+            crawl_loop()
+        except BaseException as ex:  # a worker must never die quietly
+            with lock:
+                failures.append(repr(ex)[:300])
+
+    def crawl_loop():
         while True:
             with lock:
                 while queue and queue[0] in done:
@@ -490,17 +730,24 @@ def main():
                 u = queue.popleft()
                 done.add(u)
                 count[0] += 1
-            rec, body, ctype = fetch(u, origin, rp, gate)
+            rec, body, ctype = fetch(u, origin, robots, gate)
             if body:
-                p = Page(rec.get("final") or u)
-                p.feed(body.decode(_charset(ctype, body), "replace"))
-                p.close()
-                text = "\n".join(p.blocks)
-                rec.update(canonical=p.canonical, robots=p.robots.lower(), title=" ".join(p.title.split()),
-                           h1=" ".join(p.h1.split()), words=len(text.split()), text=text[:40000],
-                           links=[[norm(h, a.keep_query) or h, z, t, rel] for h, z, t, rel in p.links])
+                try:
+                    p = Page(rec.get("final") or u)
+                    p.feed(body.decode(_charset(ctype, body), "replace"))
+                    p.close()
+                    text = "\n".join(p.blocks)
+                    links = []
+                    for h, z, t, rel in p.links:
+                        n = norm(h, a.keep_query)
+                        if n:
+                            links.append([n, z, t, rel])
+                    rec.update(canonical=p.canonical, robots=p.robots.lower(), title=" ".join(p.title.split()),
+                               h1=" ".join(p.h1.split()), words=len(text.split()), text=text[:40000], links=links)
+                except Exception as ex:  # one bad page is recorded, never fatal
+                    rec["error"] = "parse: " + str(ex)[:180]
                 with lock:
-                    for h, *_ in rec["links"]:
+                    for h, *_ in rec.get("links", []):
                         push(h)
             with lock:
                 out.write(json.dumps(rec) + "\n")
@@ -514,6 +761,9 @@ def main():
     for t in ts:
         t.join()
     out.close()
+    if failures:
+        raise SystemExit("crawl stopped: a worker failed (" + "; ".join(failures[:3]) + "). "
+                         "pages.jsonl keeps what was fetched; rerun to resume.")
 
     # Edges, deduplicated, internal only, from the latest record of each URL.
     seen = set()

@@ -17,10 +17,10 @@ from collections import Counter
 
 try:
     from . import charts
-    from .common import Markup, safe_cell
+    from .common import Markup, atomic_write, load_json, read_csv, safe_cell
 except ImportError:
     import charts
-    from common import Markup, safe_cell
+    from common import Markup, atomic_write, load_json, read_csv, safe_cell
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -93,11 +93,11 @@ def main():
     ap.add_argument("--notes")
     ap.add_argument("--date", default="")
     a = ap.parse_args()
-    F = json.load(open(os.path.join(a.focus, "focus.json")))
-    P = json.load(open(os.path.join(a.plan, "plan.json")))
-    adds = list(csv.DictReader(open(os.path.join(a.plan, "link_adds.csv"))))
-    sw = list(csv.DictReader(open(os.path.join(a.plan, "sitewide.csv"))))
-    pages = list(csv.DictReader(open(os.path.join(a.plan, "pages.csv"))))
+    F = load_json(os.path.join(a.focus, "focus.json"))
+    P = load_json(os.path.join(a.plan, "plan.json"))
+    adds = read_csv(os.path.join(a.plan, "link_adds.csv"))
+    sw = read_csv(os.path.join(a.plan, "sitewide.csv"))
+    pages = read_csv(os.path.join(a.plan, "pages.csv"))
     L, ps, Q = P["link_focus_score"], P["pagerank_share"], P["quadrants"]
     orph = P["orphaned_priority"]
 
@@ -135,25 +135,53 @@ def main():
         o.append("<p class=\"impact-work\"><strong>The work:</strong> " + "; ".join(e(w) for w in work) + ".</p>")
         o.append('<p class="impact-note">Simulated on the crawled link graph with every change from sections below applied at once. It estimates where internal PageRank and reach would move. The traffic figure is a what-if, not a forecast: it assumes the strengthened pages gain 1 to 3 positions and applies the click-through rate this site gets at each position from the Search Console export. Links do not guarantee movement; Google weighs links by context, adds external links, and ranks on far more than links. Ship in stages and measure in Search Console.</p></section>')
 
-    # Step-by-step execution guide, with one CSV per step.
+    # Step-by-step execution guide; steps with concrete rows get a CSV.
+    ST = P.get("settings") or {}
+    apg = ST.get("adds_per_page", 3)
+    tsh = ST.get("template_share", 0.5)
+    share_txt = "half" if abs(tsh - 0.5) < 1e-9 else f"{tsh:.0%} of"
+    nwords = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five"}
+    apg_txt = nwords.get(apg, str(apg))
     sc_list = P.get("scenarios") or []
     base_pri = sc_list[0]["priority"] if sc_list else 0
     deltas = {x["name"]: x["priority"] - base_pri for x in sc_list[1:-1]} if len(sc_list) > 2 else {}
     biggest = max(deltas, key=deltas.get) if deltas else ""
     exdir = os.path.join(os.path.dirname(os.path.abspath(a.out)), "execution")
     os.makedirs(exdir, exist_ok=True)
-    for f_ in os.listdir(exdir):  # replace only files sitefocus wrote before
-        if re.fullmatch(r"\d\d-[a-z0-9-]+\.csv", f_):
+    # Remove only the files the previous run listed in its manifest; anything
+    # else in execution/ belongs to you and is never touched.
+    manifest = os.path.join(exdir, ".sitefocus-manifest.json")
+    try:
+        owned = load_json(manifest).get("files", [])
+    except (OSError, ValueError, AttributeError):
+        owned = []
+    for f_ in owned:
+        if isinstance(f_, str) and re.fullmatch(r"\d\d-[a-z0-9-]+\.csv", f_) and os.path.isfile(os.path.join(exdir, f_)) \
+                and not os.path.islink(os.path.join(exdir, f_)):
             os.remove(os.path.join(exdir, f_))
+    written = []
 
     def write_csv(name, head, rows_):
-        with open(os.path.join(exdir, name), "w", newline="") as f_:
+        # Never overwrite a file this tool did not write: on a clash with one
+        # of yours (or a symlink), the list gets another name.
+        base_, n_ = name[:-4], 1
+        while True:
+            p_ = os.path.join(exdir, name)
+            if not os.path.lexists(p_) or (name in owned and not os.path.islink(p_)):
+                break
+            n_ += 1
+            name = f"{base_}-{n_}.csv"
+        if n_ > 1:
+            print(f"execution/{base_}.csv is not a sitefocus file; writing execution/{name} instead", flush=True)
+        written.append(name)
+        def fill(f_):
             w_ = csv.writer(f_)
             w_.writerow(head)
             w_.writerows([[safe_cell(c) for c in r] for r in rows_])
+        atomic_write(os.path.join(exdir, name), fill)
         return f"execution/{name}"
 
-    hyg_rows = list(csv.DictReader(open(os.path.join(a.plan, "hygiene.csv")))) if os.path.exists(os.path.join(a.plan, "hygiene.csv")) else []
+    hyg_rows = read_csv(os.path.join(a.plan, "hygiene.csv")) if os.path.exists(os.path.join(a.plan, "hygiene.csv")) else []
     sc_by = {x["name"]: x for x in (P.get("scenarios") or [])}
     steps = []
     steps.append(("Record the starting point",
@@ -169,13 +197,13 @@ def main():
                       "Start here: low risk, and most of these sit in the sitewide template, so one template edit fixes thousands of links. Point redirecting links at their final URL. For noindexed targets, keep links people need (site search, sign-in) and simply leave them out of body copy; move the rest out of the template or link the canonical page.",
                       f"{len(fix)} targets, {tot:,} links", f_,
                       "Check each target live in a browser first; a crawl can be rate limited.",
-                      "Recrawl (sitefocus run again) and confirm these rows are gone. Watch Search Console crawl stats."))
+                      "Recrawl (sitefocus run again with --fresh) and confirm these rows are gone. Watch Search Console crawl stats."))
     orph_rows = [r for r in adds if r["reason"].startswith("orphan")]
     if orph_rows:
         f_ = write_csv(f"{len(steps) + 1:02d}-link-orphaned-priority-pages.csv", ["from", "to", "reason", "similarity", "suggested_anchor"],
                        [[r["source"], r["target"], r["reason"], r["similarity"], r["suggested_anchor"]] for r in orph_rows])
         steps.append(("Link the orphaned priority pages",
-                      "Add each parent-hub link first (one per orphan; hubs may get more than three new links here), then the links from the most similar pages, in body copy with the suggested anchor.",
+                      f"Add each parent-hub link first (one per orphan; hubs may get more than {apg_txt} new links here), then the links from the most similar pages, in body copy with the suggested anchor.",
                       f"{len(P['orphaned_priority'])} pages, {len(orph_rows)} links", f_,
                       "Open the home page and each parent hub in a real browser and confirm the links really are missing (menus can be built in JavaScript).",
                       "Request indexing for each orphan in Search Console URL Inspection. Watch their impressions over 2 to 4 weeks."))
@@ -187,8 +215,8 @@ def main():
                       f"{len(P['swap'])} slots" + (f"; simulated priority share {pct(sc['priority'])}" if sc else ""), f_,
                       "Business sign-off: someone placed these links on purpose. Check their traffic in Search Console.",
                       "Compare the receiving pages' impressions and clicks over 4 weeks."))
-    for reason, title, why in (("priority", "Add contextual links to the priority pages", "Each on-topic page links to its closest priority page, in body copy where the topic comes up. Work section by section; at most three new links per page."),
-                               ("near win", "Add links to Search Console near wins", "On-topic pages already ranking 4 to 20 get links from strong, similar pages. Small ranking gains here move the most clicks."),
+    for reason, title, why in (("near win", "Add links to Search Console near wins", "On-topic pages already ranking 4 to 20 get links from strong, similar pages. Small ranking gains here move the most clicks."),
+                               ("priority", "Add contextual links to the priority pages", f"Each on-topic page links to its closest priority page, in body copy where the topic comes up. Work section by section; at most {apg_txt} new links per page."),
                                ("underlinked", "Strengthen underlinked on-topic pages", "Strong pages link to similar on-topic pages that get little link weight today. This also fixes pages whose PageRank runs ahead of their reach.")):
         rr = [r for r in adds if r["reason"] == reason]
         if rr:
@@ -201,7 +229,7 @@ def main():
     sm = next((x for x in (P.get("scenarios") or []) if "module" in x["name"]), None)
     if msec and sm:
         steps.append((f"Optional: a related-products module on /{msec}/",
-                      f"A template module that links every /{msec}/ page to its three closest priority pages. Simulated priority share {pct(sm['priority'])} against {pct(base_pri)} today; test it on part of the section before rolling it out.",
+                      f"A template module that links each /{msec}/ page (except pages marked nofollow) to up to three of its closest priority pages. Simulated priority share {pct(sm['priority'])} against {pct(base_pri)} today; test it on part of the section before rolling it out.",
                       "one template change", None,
                       "Test on a tenth of the section first.", "Compare the tested pages with the rest over 4 to 8 weeks."))
     if P.get("slot_scenario"):
@@ -226,6 +254,7 @@ def main():
                   "one run", None, "Use the same --priority file and the same embedding model.",
                   "Repeat monthly while changes ship."))
 
+    atomic_write(manifest, lambda f_: json.dump({"tool": "sitefocus", "files": written}, f_))
     o.append('<section class="steps-wrap"><h2>How to execute, in order</h2><p>Safest and highest value first. Each step has its own list in <code>execution/</code>. Ship a step, check it, then move on.</p><ol class="steps">')
     for title, why, count, f_, check, measure in steps:
         o.append(f"<li><h3>{e(title)}</h3><p>{e(why)}</p><dl>"
@@ -242,7 +271,9 @@ def main():
 
     o.append("<h2>What we found</h2><ul>")
     if a.notes:
-        for line in open(a.notes, encoding="utf-8"):
+        with open(a.notes, encoding="utf-8") as f_:
+            note_lines = f_.read().splitlines()
+        for line in note_lines:
             if line.strip():
                 o.append(f"<li>{e(line.strip())}</li>")
     if orph:
@@ -251,7 +282,7 @@ def main():
     else:
         o.append(f"<li>Every priority page has at least three internal links pointing at it.</li>")
     o.append(f"<li>Underlinked pages (on topic, weakly linked): {Q['underlinked']['pages'][0]:,} pages holding {pct(Q['underlinked']['pagerank'][0])} of internal PageRank, {pct(Q['underlinked']['pagerank'][1])} after the plan.</li>")
-    o.append(f"<li>Leaks (off topic, well linked): {Q['leak']['pages'][0]:,} pages holding {pct(Q['leak']['pagerank'][0])}. {len(P['sitewide_leaks'])} of them are linked from at least half the site.</li>")
+    o.append(f"<li>Leaks (off topic, well linked): {Q['leak']['pages'][0]:,} pages holding {pct(Q['leak']['pagerank'][0])}. {len(P['sitewide_leaks'])} of them are linked from at least {share_txt} the site.</li>")
     o.append(f"<li>Priority pages hold {pct(ps['priority'][0])} of internal PageRank now, {pct(ps['priority'][1])} after the links and {pct(ps['priority'][2])} with the swap.</li></ul>")
 
     sc = P.get("scenarios") or []
@@ -310,7 +341,7 @@ def main():
     c = P["adds"]
     o.append(f"<p>{P['adds_total']:,} links: {c.get('orphan: parent hub', 0) + c.get('orphan: similar page', 0)} into orphaned priority pages, "
              f"{c.get('priority', 0):,} from on-topic pages to their closest priority page, {c.get('near win', 0):,} to near wins from Search Console, {c.get('underlinked', 0):,} from strong pages to underlinked ones. "
-             "Order: orphaned priority pages, then near wins, then priority pages, then underlinked pages; strongest source pages first. At most three new links per source page and never between near-duplicates, except parent-hub links to orphaned pages, which are listed separately. Pages marked nofollow are never used as sources. Place each in body copy where the topic comes up. Full list with suggested anchors: <code>link_adds.csv</code>.</p>")
+             f"Order: orphaned priority pages (a link from the parent hub, then the most similar pages), then near wins, then priority pages, then underlinked pages, strongest source pages first. At most {apg_txt} new links per source page and never between near-duplicates, except parent-hub links to orphaned pages, which have no cap. Pages marked nofollow are never used as sources. Place each in body copy where the topic comes up. Full list with suggested anchors: <code>link_adds.csv</code>.</p>")
     for reason, label in (("priority", "To priority pages"), ("near win", "To near wins"), ("underlinked", "To underlinked pages")):
         rows = [r for r in adds if r["reason"] == reason]
         if rows:
@@ -319,7 +350,7 @@ def main():
             o.append(table(["Page receiving links", "New links"], [[link(u), k] for u, k in Counter(r["target"] for r in rows).most_common(10)]))
 
     o.append("<h2>4. Sitewide links</h2>")
-    o.append(f"<p>{P['sitewide_targets']} pages are linked from at least half the site (navigation, footer, sitewide modules). Full list: <code>sitewide.csv</code>.</p>")
+    o.append(f"<p>{P['sitewide_targets']} pages are linked from at least {share_txt} the site (navigation, footer, sitewide modules). Full list: <code>sitewide.csv</code>.</p>")
     flagged = [r for r in sw if r["flag"] and r["flag"] != "leak"]
     if flagged:
         o.append("<h3>Slots that could go to products</h3>")
@@ -337,8 +368,10 @@ def main():
         o.append("<p>Harmonic centrality, called reach in this report, is the average of 1 ÷ clicks from every other page on the site. 1.0 means one click from every page, 0.5 about two clicks, 0 unreachable by links. "
                  "It is the same measure Common Crawl uses to rank whole hosts and domains on the web, computed here inside the site, page by page, on the crawled link graph (exact, not estimated). "
                  "PageRank says how much link weight flows in; reach says how easily the rest of the site gets there. "
-                 f"On this site the two agree {'weakly' if R['spearman_links'] < 0.4 else 'moderately' if R['spearman_links'] < 0.7 else 'strongly'} (rank correlation {R['spearman_links']})"
-                 + (", so reach adds information.</p>" if R['spearman_links'] < 0.7 else ".</p>"))
+                 + (f"On this site the two agree {'weakly' if R['spearman_links'] < 0.4 else 'moderately' if R['spearman_links'] < 0.7 else 'strongly'} (rank correlation {R['spearman_links']})"
+                    + (", so reach adds information.</p>" if R['spearman_links'] < 0.7 else ".</p>")
+                    if R.get("spearman_links") is not None else
+                    "Their rank correlation cannot be calculated here: PageRank or reach is the same for every page.</p>"))
         o.append(table(["", "Now", "After the links"], [
             ["Median harmonic centrality, priority pages", R["priority_reach_median"][0], R["priority_reach_median"][1]],
             ["Median harmonic centrality, all pages", R["site_reach_median"][0], R["site_reach_median"][1]]]))
@@ -363,7 +396,8 @@ def main():
                   "rate_limited": ("Links the crawl could not check (rate limited)", "Recheck these URLs; they are not known to be broken."),
                   "to_uncrawled": ("Links to pages blocked or never fetched", "Usually robots.txt; check they are meant to be blocked."),
                   "nofollow": ("Internal nofollow links", "Remove nofollow, or remove the link; nofollow does not redirect PageRank."),
-                  "account": ("Links to sign-in, sign-up, account or cart pages", "Fine for users. Keep them out of body copy; nofollow is acceptable here for crawl hygiene.")}
+                  "account": ("Links to sign-in, sign-up, account or cart pages", "Fine for users. Keep them out of body copy; nofollow is acceptable here for crawl hygiene."),
+                  "page_nofollow": ("Links on pages with meta robots nofollow", "These pages pass nothing. Remove the page-level nofollow unless you mean it.")}
         for k, (lab, fix) in labels.items():
             v = H.get(k)
             if v and v["links"]:
@@ -428,7 +462,7 @@ def main():
 
     o.append("<h2>Method and limits</h2><ul>"
              "<li>Google's leaked Content Warehouse API documentation (May 2024) names site focus and radius attributes (siteFocusScore, siteRadius, siteEmbeddings). It does not publish formulas, models or weights. Everything here is a transparent proxy.</li>"
-             f"<li>Topic: cosine similarity of each page to the centre of the priority pages, as a percentile. Page vectors come from {e(F.get('model', 'nomic-embed-text'))} (run locally) over title, H1 and main text, with text blocks found on more than {F.get('boilerplate_cut', 20):,} pages removed (15% of pages, minimum 20).</li>"
+             f"<li>Topic: cosine similarity of each page to the centre of the priority pages, as a percentile. Page vectors come from {e(F.get('model', 'nomic-embed-text'))} ({ {True: 'run on this machine', False: 'run on the Ollama server you configured'}.get(F.get('embedding_server_local'), 'run on the Ollama server used for the embed step') }) over title, H1 and main text, with text blocks found on more than {F.get('boilerplate_cut', 20):,} pages removed ({F.get('boilerplate_share', 0.15):.0%} of pages, minimum 20).</li>"
              f"<li>The topic is anchored on the priority pages on purpose. The plain proxy (similarity to the average page: focus {P['plain_focus']['focus']}, median radius {P['plain_focus']['radius_median']}) is set by whatever the site has most of, and on directory-heavy sites it calls editorial content off-topic.</li>"
              f"<li>Links: internal PageRank, damping 0.85, one edge per page pair, indexable same-host pages. Navigation, footer and sitewide links count {P.get('model', {}).get('template_weight', 1)} of a link in body copy (a reasonable-surfer approximation). "
              + ("External links are included: each page's starting share grows with the square root of its linking sites from the backlink export. " if P.get("model", {}).get("backlinks") else "External links are not included (add --backlinks). ")
@@ -443,7 +477,8 @@ def main():
     shutil.copy(css_path(), os.path.join(d, "report.css"))
     for f in ("pages.csv", "link_adds.csv", "sitewide.csv"):
         shutil.copy(os.path.join(a.plan, f), os.path.join(d, f))
-    open(a.out, "w", encoding="utf-8").write(
+    with open(a.out, "w", encoding="utf-8") as f_:
+        f_.write(
         '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">'
         f"<title>Site focus and internal linking: {e(a.site)}</title><link rel=\"stylesheet\" href=\"report.css\"></head><body><main>" + "\n".join(o) + "</main>" + charts.SCRIPT + "</body></html>")
     print(f"wrote {a.out}")

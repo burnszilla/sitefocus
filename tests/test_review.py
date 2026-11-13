@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
 
 import fixtures
-from _helpers import mod, run
+from _helpers import jload, mod, rcsv, rtext, run, wtext
 
 SITE = OLL = OFF = None
 W = BASE = ""
@@ -69,22 +69,86 @@ def pages():
 
 class TestReportSafety(unittest.TestCase):
     def test_hostile_title_is_escaped(self):  # finding: HTML injection through table cells
-        html = open(os.path.join(W, "report", "index.html"), encoding="utf-8").read()
+        html = rtext(os.path.join(W, "report", "index.html"))
+        self.assertIn("&lt;img src=x onerror", html)  # the payload is in the report, escaped
         self.assertNotIn("<img src=x onerror", html)
+
+    def test_undefined_correlation_is_explained(self):  # second review N7, through the report
+        d = tempfile.mkdtemp()
+        try:
+            plan = os.path.join(d, "plan")
+            shutil.copytree(os.path.join(W, "plan"), plan)
+            P = jload(os.path.join(plan, "plan.json"))
+            P["reach"]["spearman_links"] = None
+            with open(os.path.join(plan, "plan.json"), "w") as f:
+                json.dump(P, f)
+            run("focus_report", ["--focus", f"{W}/embed", "--plan", plan, "--site", "fixture", "--out", os.path.join(d, "r", "index.html")])
+            html = rtext(os.path.join(d, "r", "index.html"))
+            self.assertIn("cannot be calculated", html)
+            self.assertNotIn("agree strongly", html)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
 
     def test_markup_is_trusted_only_when_generated(self):
         fr = mod("focus_report")
         self.assertEqual(fr.cell("<b>x</b>"), "&lt;b&gt;x&lt;/b&gt;")
         self.assertEqual(fr.cell(mod("common").Markup("<b>x</b>")), "<b>x</b>")
 
-    def test_regeneration_keeps_user_files(self):  # finding: rmtree of execution/
-        keep = os.path.join(W, "report", "execution", "analyst-notes.txt")
-        open(keep, "w").write("mine")
+    def test_regeneration_keeps_user_files(self):  # finding: rmtree of execution/; second review R1
+        ex = os.path.join(W, "report", "execution")
+        with open(os.path.join(ex, ".sitefocus-manifest.json")) as f:
+            owned = json.load(f)["files"]
+        self.assertTrue(owned)
+        mine = [os.path.join(ex, "analyst-notes.txt"), os.path.join(ex, "01-analyst-notes.csv"), os.path.join(ex, "99-my-own-list.csv")]
+        for p in mine:
+            with open(p, "w") as f:
+                f.write("mine")
+        # A file of yours that has the name of a list sitefocus is about to write (third review T5).
+        clash = owned[0]
+        with open(os.path.join(ex, ".sitefocus-manifest.json"), "w") as f:
+            json.dump({"files": owned[1:]}, f)
+        with open(os.path.join(ex, clash), "w") as f:
+            f.write("mine")
+        mine.append(os.path.join(ex, clash))
         run("focus_report", ["--focus", f"{W}/embed", "--plan", f"{W}/plan", "--site", "fixture", "--out", f"{W}/report/index.html"])
-        self.assertTrue(os.path.exists(keep))
+        for p in mine:
+            self.assertTrue(os.path.exists(p), p)
+            with open(p) as f:
+                self.assertEqual(f.read(), "mine")
+        new = jload(os.path.join(ex, ".sitefocus-manifest.json"))["files"]
+        self.assertIn(clash[:-4] + "-2.csv", new)
+        self.assertNotIn(clash, new)
+        self.assertIn(f"execution/{clash[:-4]}-2.csv", rtext(os.path.join(W, "report", "index.html")))
+
+    def test_temporary_files_never_touch_existing_paths(self):  # fourth review F1
+        ex = os.path.join(W, "report", "execution")
+        names = jload(os.path.join(ex, ".sitefocus-manifest.json"))["files"]
+        victims = []
+        for i, name in enumerate(names[:2] + [".sitefocus-manifest.json"]):
+            v = os.path.join(W, f"victim-{i}.txt")
+            with open(v, "w") as f:
+                f.write("mine")
+            victims.append(v)
+            tmp = os.path.join(ex, f".{name}.tmp") if not name.startswith(".") else os.path.join(ex, name + ".tmp")
+            if i == 0:
+                with open(tmp, "w") as f:  # an ordinary file at the old predictable temporary name
+                    f.write("mine")
+                victims.append(tmp)
+            else:
+                os.symlink(v, tmp)  # a symlink at the old predictable temporary name
+        run("focus_report", ["--focus", f"{W}/embed", "--plan", f"{W}/plan", "--site", "fixture", "--out", f"{W}/report/index.html"])
+        for v in victims:
+            with open(v) as f:
+                self.assertEqual(f.read(), "mine", v)
+        for name in jload(os.path.join(ex, ".sitefocus-manifest.json"))["files"]:
+            self.assertFalse(os.path.islink(os.path.join(ex, name)), name)
+        planted = {".sitefocus-manifest.json.tmp"} | {f".{n}.tmp" for n in names[:2]}
+        self.assertFalse([f for f in os.listdir(ex) if f.endswith(".tmp") and f not in planted])  # no temporary file of ours left
+        for p in planted:
+            self.assertTrue(os.path.lexists(os.path.join(ex, p)), p)  # and the planted ones are still there
 
     def test_formula_cells_are_neutralised(self):  # finding: CSV formula injection
-        rows = list(csv.DictReader(open(os.path.join(W, "plan", "pages.csv"))))
+        rows = rcsv(os.path.join(W, "plan", "pages.csv"))
         titles = [r["title"] for r in rows if "HYPERLINK" in r["title"]]
         self.assertTrue(titles and all(t.startswith("'") for t in titles))
 
@@ -117,6 +181,8 @@ class TestCrawlScope(unittest.TestCase):
         t = sorted(x for x, p in MAIN_REQUESTS)
         rate = (len(t) - 1) / (t[-1] - t[0])
         self.assertLessEqual(rate, 22)
+        gaps = [b - a for a, b in zip(t, t[1:])]
+        self.assertGreaterEqual(min(gaps), 0.025)  # no bursts: arrivals never much closer than the 0.05 s grant spacing
 
     def test_paragraph_with_inline_markup_is_one_block(self):  # finding: parser splits paragraphs
         text = pages()[f"{BASE}/odd/inline/"]["text"]
@@ -157,7 +223,7 @@ class TestCrawlLifecycle(unittest.TestCase):
             run("site_crawl", ["--start", f"http://localhost:{red.server_port}/", "--out", out, "--max-pages", 6, "--delay", 0])
             got = mod("common").read_pages(os.path.join(out, "pages.jsonl"))
             self.assertGreaterEqual(len(got), 5)
-            self.assertEqual(json.load(open(os.path.join(out, "meta.json")))["origin_host"], "127.0.0.1")
+            self.assertEqual(jload(os.path.join(out, "meta.json"))["origin_host"], "127.0.0.1")
         finally:
             red.shutdown()
             shutil.rmtree(out, ignore_errors=True)
@@ -205,13 +271,15 @@ class TestEmbedding(unittest.TestCase):
             src = os.path.join(out, "pages.jsonl")
             recs = [{"url": f"https://t.test/{i}/", "final": f"https://t.test/{i}/", "status": 200, "title": f"P{i}",
                      "h1": "", "text": f"garden widgets page number {i} with pricing"} for i in range(4)]
-            open(src, "w").write("".join(json.dumps(r) + "\n" for r in recs))
+            wtext(src, "".join(json.dumps(r) + "\n" for r in recs))
             run("site_focus", ["--pages", src, "--out", out, "--ollama", os.environ["SITEFOCUS_OLLAMA"]])
-            v1 = np.load(os.path.join(out, "vectors.npy"))
+            with np.load(os.path.join(out, "vectors.npz")) as z:
+                v1 = z["vecs"]
             recs[0]["text"] = "compost heaps and kitchen scraps instead"
-            open(src, "w").write("".join(json.dumps(r) + "\n" for r in recs))
+            wtext(src, "".join(json.dumps(r) + "\n" for r in recs))
             run("site_focus", ["--pages", src, "--out", out, "--ollama", os.environ["SITEFOCUS_OLLAMA"]])
-            v2 = np.load(os.path.join(out, "vectors.npy"))
+            with np.load(os.path.join(out, "vectors.npz")) as z:
+                v2 = z["vecs"]
             self.assertFalse(np.allclose(v1[0], v2[0]))
             np.testing.assert_allclose(v1[1:], v2[1:])
         finally:
@@ -226,7 +294,7 @@ class TestEmbedding(unittest.TestCase):
         out = tempfile.mkdtemp()
         try:
             src = os.path.join(out, "pages.jsonl")
-            open(src, "w").write("".join(json.dumps({"url": f"https://t.test/{i}/", "status": 200, "robots": "noindex", "title": "x",
+            wtext(src, "".join(json.dumps({"url": f"https://t.test/{i}/", "status": 200, "robots": "noindex", "title": "x",
                                                      "h1": "", "text": "words here"}) + "\n" for i in range(3)))
             with self.assertRaises(SystemExit) as cm:
                 run("site_focus", ["--pages", src, "--out", out, "--ollama", os.environ["SITEFOCUS_OLLAMA"]])
@@ -250,7 +318,8 @@ class TestModel(unittest.TestCase):
         self.assertLess(with_nf.sum(), 1.0)
 
     def test_nofollow_pages_are_never_link_sources(self):  # finding: nofollow pages as donors
-        adds = list(csv.DictReader(open(os.path.join(W, "plan", "link_adds.csv"))))
+        adds = rcsv(os.path.join(W, "plan", "link_adds.csv"))
+        self.assertTrue(adds)
         self.assertFalse(any(r["source"] == f"{BASE}/blog/4/" for r in adds))
 
     def test_pick_site_respects_boundaries(self):  # finding: lookalike GSC property
@@ -289,7 +358,7 @@ class TestCredentials(unittest.TestCase):
         d = tempfile.mkdtemp()
         try:
             p = os.path.join(d, "gsc.json")
-            open(p, "w").write("{}")
+            wtext(p, "{}")
             os.chmod(p, 0o644)
             mod("common").write_private(p, '{"refresh_token": "x"}')
             self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), 0o600)

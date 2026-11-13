@@ -8,7 +8,7 @@ import tempfile
 import unittest
 
 import fixtures
-from _helpers import run
+from _helpers import jload, rcsv, rtext, run, wtext
 
 WORK = None
 SITE = OLL = None
@@ -44,7 +44,7 @@ def tearDownModule():
 
 
 def crawled():
-    return {json.loads(l)["url"]: json.loads(l) for l in open(os.path.join(WORK, "crawl", "pages.jsonl"))}
+    return {json.loads(l)["url"]: json.loads(l) for l in rtext(os.path.join(WORK, "crawl", "pages.jsonl")).splitlines() if l.strip()}
 
 
 class TestCrawl(unittest.TestCase):
@@ -64,14 +64,14 @@ class TestCrawl(unittest.TestCase):
         self.assertEqual(crawled()[f"{BASE}/flaky/"]["status"], 200)
 
     def test_root_is_one_page(self):
-        pages = json.load(open(os.path.join(WORK, "embed", "pages.json")))
+        pages = jload(os.path.join(WORK, "embed", "pages.json"))
         roots = [p for p in pages if p["url"].rstrip("/") == BASE]
         self.assertEqual(len(roots), 1)
 
 
 class TestIndexability(unittest.TestCase):
     def setUp(self):
-        self.p = {x["url"]: x for x in json.load(open(os.path.join(WORK, "embed", "pages.json")))}
+        self.p = {x["url"]: x for x in jload(os.path.join(WORK, "embed", "pages.json"))}
 
     def test_meta_noindex(self):
         self.assertFalse(self.p[f"{BASE}/search/"]["indexable"])
@@ -85,7 +85,7 @@ class TestIndexability(unittest.TestCase):
 
 class TestPlan(unittest.TestCase):
     def setUp(self):
-        self.P = json.load(open(os.path.join(WORK, "plan", "plan.json")))
+        self.P = jload(os.path.join(WORK, "plan", "plan.json"))
 
     def test_orphan_ignores_links_from_nofollow_pages(self):
         orph = [o["url"] for o in self.P["orphaned_priority"]]
@@ -96,18 +96,18 @@ class TestPlan(unittest.TestCase):
         self.assertGreaterEqual(I["orphans"][0], 1)
         self.assertEqual(I["orphans"][1], 0)
         self.assertGreaterEqual(I["priority_reach_min"][1], I["priority_reach_min"][0])
-        adds = list(csv.DictReader(open(os.path.join(WORK, "plan", "link_adds.csv"))))
+        adds = rcsv(os.path.join(WORK, "plan", "link_adds.csv"))
         self.assertTrue(any(r["target"] == f"{BASE}/products/industrial/" for r in adds))
 
     def test_hygiene_redirect_and_broken(self):
-        h = {r["target"]: r for r in csv.DictReader(open(os.path.join(WORK, "plan", "hygiene.csv")))}
+        h = {r["target"]: r for r in rcsv(os.path.join(WORK, "plan", "hygiene.csv"))}
         self.assertEqual(h[f"{BASE}/old-widgets"]["issue"], "links to a redirect")
         self.assertEqual(h[f"{BASE}/old-widgets"]["points_to"], f"{BASE}/products/widgets/")
         self.assertEqual(h[f"{BASE}/missing-page"]["issue"], "links to a broken page")
         self.assertEqual(h[f"{BASE}/missing-page"]["rechecked_live"], "1")
 
     def test_flaky_page_is_not_reported_broken(self):
-        h = {r["target"]: r for r in csv.DictReader(open(os.path.join(WORK, "plan", "hygiene.csv")))}
+        h = {r["target"]: r for r in rcsv(os.path.join(WORK, "plan", "hygiene.csv"))}
         self.assertNotIn(f"{BASE}/flaky/", h)
 
     def test_scores_are_in_range(self):
@@ -121,14 +121,16 @@ class TestPlan(unittest.TestCase):
         self.assertIn("not enough", t["reason"])
 
     def test_every_add_has_an_instruction(self):
-        for r in csv.DictReader(open(os.path.join(WORK, "plan", "link_adds.csv"))):
+        rows = rcsv(os.path.join(WORK, "plan", "link_adds.csv"))
+        self.assertTrue(rows)
+        for r in rows:
             self.assertTrue(r["instruction"])
             self.assertTrue(r["suggested_anchor"])
 
 
 class TestReport(unittest.TestCase):
     def test_sections_and_files(self):
-        html = open(os.path.join(WORK, "report", "index.html"), encoding="utf-8").read()
+        html = rtext(os.path.join(WORK, "report", "index.html"))
         for s in ("Estimated impact if every change ships", "How to execute, in order", "Link hygiene",
                   "Where nofollow belongs", "Harmonic centrality (reach)", "pagemap"):
             self.assertIn(s, html)
@@ -137,8 +139,12 @@ class TestReport(unittest.TestCase):
         self.assertTrue(any("orphaned-priority" in f for f in ex))
 
     def test_titles_are_escaped(self):
-        html = open(os.path.join(WORK, "report", "index.html"), encoding="utf-8").read()
-        self.assertNotIn("<script>alert", html)
+        # Every crawled title that holds markup characters appears escaped, never raw.
+        html = rtext(os.path.join(WORK, "report", "index.html"))
+        risky = [r["title"] for r in rcsv(os.path.join(WORK, "plan", "pages.csv")) if any(c in r["title"] for c in "<>&\"")]
+        self.assertTrue(risky)  # the fixture has titles with markup characters
+        for t in risky:
+            self.assertNotIn(t, html)
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sitefocus"
-version = "1.4.2"
+version = "1.5.0"
 description = "Site focus and internal linking: Link Focus Score, page map, and a simulated internal linking plan."
 readme = "README.md"
 requires-python = ">=3.9"

@@ -1,8 +1,20 @@
 """Shared helpers for sitefocus: safe reading of the crawl file, safe CSV
 cells, trusted HTML markup, and private atomic file writes."""
+import csv
 import json
 import os
+import re
 import tempfile
+
+
+def load_json(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def read_csv(path):
+    with open(path, newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
 
 
 def read_pages(path):
@@ -25,17 +37,31 @@ def read_pages(path):
     return list(out.values())
 
 
-def repair_jsonl_tail(path):
+def repair_jsonl_tail(path, chunk=1 << 16):
     """If the last line of a JSONL file is incomplete or invalid (the process
     was killed mid-write), move it to <path>.damaged and truncate the file so
-    appends start on a clean line. Returns True if anything was repaired."""
+    appends start on a clean line. Reads only the tail of the file. Returns
+    True if anything was repaired."""
     if not os.path.exists(path) or os.path.getsize(path) == 0:
         return False
+    size = os.path.getsize(path)
     with open(path, "rb") as f:
-        data = f.read()
-    complete = data.endswith(b"\n")
-    body = data[:-1] if complete else data
-    last = body.rsplit(b"\n", 1)[-1]
+        f.seek(size - 1)
+        complete = f.read(1) == b"\n"
+        end = size - 1 if complete else size
+        # Seek back to the newline before the last line.
+        pos, start = end, 0
+        while pos > 0:
+            step = min(chunk, pos)
+            f.seek(pos - step)
+            buf = f.read(step)
+            k = buf.rfind(b"\n")
+            if k >= 0:
+                start = pos - step + k + 1
+                break
+            pos -= step
+        f.seek(start)
+        last = f.read(end - start)
     try:
         json.loads(last)
         valid = True
@@ -47,28 +73,53 @@ def repair_jsonl_tail(path):
         with open(path, "ab") as f:
             f.write(b"\n")
         return True
-    cut = len(body) - len(last)
     with open(path + ".damaged", "ab") as f:
         f.write(last + b"\n")
     with open(path, "r+b") as f:
-        f.truncate(cut)
+        f.truncate(start)
     return True
 
 
-_FORMULA = ("=", "+", "-", "@", "\t", "\r")
+_FORMULA = re.compile(r"^[\x00-\x20]*[=+\-@]|^[\x00-\x1f]")
 
 
 def safe_cell(v):
-    """Neutralise spreadsheet formula injection in text cells: a cell that
-    starts with = + - @ or a control character gets a leading apostrophe.
+    """Neutralise spreadsheet formula injection in a text cell: one that
+    starts with = + - @, possibly after spaces or control characters, or
+    that starts with any control character, gets a leading apostrophe.
     URLs and numbers are left alone."""
-    if isinstance(v, str) and v and v[0] in _FORMULA and not v.startswith(("http://", "https://")):
+    if isinstance(v, str) and v and _FORMULA.match(v) and not v.startswith(("http://", "https://")):
         try:
             float(v)
             return v
         except ValueError:
             return "'" + v
     return v
+
+
+def atomic_write(path, writer, binary=False):
+    """Write path atomically: writer(f) fills a new temporary file with an
+    unpredictable name (created exclusively, so it can never be an existing
+    file or symlink), which then replaces path. If path is a symlink, the link
+    itself is replaced; its target is never written."""
+    d = os.path.dirname(os.path.abspath(path))
+    # Keep the permissions the file already had, else the usual ones for a
+    # new file (mkstemp alone would make every output owner-only).
+    if os.path.isfile(path) and not os.path.islink(path):
+        mode = os.stat(path).st_mode & 0o777
+    else:
+        um = os.umask(0)
+        os.umask(um)
+        mode = 0o666 & ~um
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".sitefocus-", suffix=".tmp")
+    try:
+        os.chmod(tmp, mode)
+        with (os.fdopen(fd, "wb") if binary else os.fdopen(fd, "w", newline="", encoding="utf-8")) as f:
+            writer(f)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 
 class Markup(str):

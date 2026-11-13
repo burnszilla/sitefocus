@@ -21,14 +21,18 @@ Usage:
       [--ollama http://localhost:11434] [--model nomic-embed-text] [--k 12]
   The Ollama URL defaults to $SITEFOCUS_OLLAMA, else http://localhost:11434.
 
-Writes out/vectors.npy, out/pages.json (per page), out/focus.json (site,
-section, cluster summaries and drop-one-section what-ifs).
-Needs numpy. Embeddings are cached; rerun is cheap.
+Writes out/vectors.npz (page vectors, URLs, generation id), out/pages.json
+(per page), out/focus.json (site, section, cluster summaries and
+drop-one-section what-ifs; written last, with the same generation id) and
+out/chunks.npz (the embedding cache). Pages whose embedding comes back empty
+are left out with a warning. Needs numpy. Embeddings are cached by content;
+rerun is cheap.
 """
 import argparse
 import json
 import os
 import re
+import time
 import urllib.request
 from collections import Counter, defaultdict
 from urllib.parse import urlsplit
@@ -38,9 +42,9 @@ import hashlib
 import numpy as np
 
 try:
-    from .common import read_pages
+    from .common import atomic_write, load_json, read_pages
 except ImportError:
-    from common import read_pages
+    from common import atomic_write, load_json, read_pages
 
 
 def section_of(url):
@@ -52,7 +56,12 @@ def _post(base, model, texts, timeout):
     body = json.dumps({"model": model, "input": texts, "truncate": True}).encode()
     req = urllib.request.Request(f"{base}/api/embed", data=body, headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.load(r)["embeddings"]
+        got = json.load(r)["embeddings"]
+    # Exactly one vector per text, or the batch is rejected: a short reply
+    # would shift every later vector onto the wrong text.
+    if not isinstance(got, list) or len(got) != len(texts) or not all(isinstance(v, list) and v for v in got):
+        raise ValueError(f"embedding server returned {len(got) if isinstance(got, list) else 'no'} vectors for {len(texts)} texts")
+    return got
 
 
 def _robust(base, model, texts, timeout=20, tries=3):
@@ -76,12 +85,12 @@ def embed(texts, base, model, batch=16, cache=None, ids=None):
     out = []
     if cache and os.path.exists(cache):
         try:
-            saved = json.load(open(cache))
+            saved = load_json(cache)
             if isinstance(saved, dict):
                 k = 0
                 while k < len(saved["ids"]) and k < len(ids) and saved["ids"][k] == ids[k]:
                     k += 1
-                out = saved["vecs"][:k]
+                out = saved["vecs"][:min(k, len(saved["vecs"]))]
         except Exception:
             out = []
         print(f"  resuming at {len(out)} of {len(texts)}", flush=True)
@@ -89,12 +98,16 @@ def embed(texts, base, model, batch=16, cache=None, ids=None):
     t0 = _t.time()
     for i in range(len(out), len(texts), batch):
         tb = _t.time()
-        out += _robust(base, model, texts[i:i + batch])
+        got = _robust(base, model, texts[i:i + batch])
+        if len(got) != len(texts[i:i + batch]):
+            raise SystemExit(f"embedding batch at {i} came back with {len(got)} vectors for {len(texts[i:i + batch])} texts; stopping")
+        out += got
         dt = _t.time() - tb
         if dt > 20:
             print(f"  slow batch at {i}: {dt:.0f}s", flush=True)
         if cache and ((i // batch) % 10 == 0 or i + batch >= len(texts)):
-            json.dump({"ids": ids[:len(out)], "vecs": out}, open(cache, "w"))
+            with open(cache, "w") as f:
+                json.dump({"ids": ids[:len(out)], "vecs": out}, f)
             rate = (len(out)) / max(_t.time() - t0, 1) * 60
             print(f"  embedded {len(out)}/{len(texts)} ({rate:.0f}/min)", flush=True)
     if cache and os.path.exists(cache):
@@ -157,8 +170,13 @@ def main():
             final += "/"
         canon = (r.get("canonical") or final).split("#")[0]
         robots = (r.get("robots") or "") + " " + (r.get("x_robots") or "")
-        r["indexable"] = "noindex" not in robots and "none" not in robots.split() and canon.rstrip("/") == final.rstrip("/")
-        r["nofollow_page"] = "nofollow" in robots or "none" in robots.split()
+        # Directives from every meta tag and X-Robots-Tag header, split on
+        # commas and spaces; "none" means noindex and nofollow.
+        # A directive addressed to a named bot ("googlebot: noindex") is
+        # applied too: the conservative reading.
+        toks = set(re.split(r"[\s,:]+", robots.lower()))
+        r["indexable"] = not ({"noindex", "none"} & toks) and canon.rstrip("/") == final.rstrip("/")
+        r["nofollow_page"] = bool({"nofollow", "none"} & toks)
         r["final"] = final
         recs.append(r)
     seen, pages = set(), []
@@ -189,12 +207,18 @@ def main():
 
     # Embeddings are cached per chunk, keyed by a hash of the model and the
     # exact text sent. Changed pages are re-embedded; unchanged ones are not.
+    # The cache is one file (chunks.npz: hashes and vectors together), so
+    # it is replaced in one atomic step and a hash can never label the
+    # wrong vector. Empty or invalid vectors are never cached.
     hashes = [hashlib.sha1(f"{a.model}\x00{d}".encode("utf-8", "replace")).hexdigest() for d in docs]
-    ck_path, cv_path = os.path.join(a.out, "chunks.keys.json"), os.path.join(a.out, "chunks.npy")
+    cz_path = os.path.join(a.out, "chunks.npz")
     cache = {}
-    if os.path.exists(ck_path) and os.path.exists(cv_path):
+    if os.path.exists(cz_path):
         try:
-            cache = dict(zip(json.load(open(ck_path)), np.load(cv_path)))
+            with np.load(cz_path, allow_pickle=False) as z:
+                ks, vs = list(z["keys"]), z["vecs"]
+            if len(ks) == len(vs):
+                cache = dict(zip(ks, vs))
         except Exception:
             cache = {}
     missing = [i_ for i_, h in enumerate(hashes) if h not in cache]
@@ -202,29 +226,50 @@ def main():
         print(f"embedding {len(missing)} of {len(docs)} chunks ({len(pages)} pages) with {a.model}", flush=True)
         new = embed([docs[i_] for i_ in missing], a.ollama, a.model,
                     cache=os.path.join(a.out, "vectors.partial.json"), ids=[hashes[i_] for i_ in missing])
+        bad = 0
         for i_, v in zip(missing, new):
-            cache[hashes[i_]] = v
+            v = np.asarray(v, dtype=np.float32)
+            if v.ndim == 1 and len(v) and np.isfinite(v).all() and np.linalg.norm(v) > 1e-9:
+                cache[hashes[i_]] = v
+            else:
+                bad += 1
+        if bad:
+            print(f"warning: {bad} chunks came back empty or invalid from the embedding model; they are skipped", flush=True)
     else:
         print(f"all {len(docs)} chunks already embedded; reusing", flush=True)
-    C = np.array([cache[h] for h in hashes], dtype=np.float32)
+    dims = {len(v) for v in cache.values()}
+    if len(dims) > 1:
+        raise SystemExit(f"embedding vectors have mixed sizes {sorted(dims)}; delete {cz_path} and rerun")
+    if not dims:
+        raise SystemExit("the embedding model returned no usable vectors; check it with `sitefocus doctor`")
+    dim = dims.pop()
+    C = np.array([cache.get(h, np.zeros(dim, np.float32)) for h in hashes], dtype=np.float32)
     cn = np.linalg.norm(C, axis=1, keepdims=True)
     C = C / np.where(cn == 0, 1, cn)
-    V = np.zeros((len(pages), C.shape[1]), dtype=np.float32)
+    V = np.zeros((len(pages), dim), dtype=np.float32)
     np.add.at(V, np.array(owner), C)
+    vn = np.linalg.norm(V, axis=1)
+    okp = vn > 1e-6
+    if not okp.all():
+        print(f"warning: {int((~okp).sum())} pages have no usable embedding and are left out", flush=True)
+        pages = [p for p, ok in zip(pages, okp) if ok]
+        main_words = [w for w, ok in zip(main_words, okp) if ok]
+        V, vn = V[okp], vn[okp]
+    if not pages:
+        raise SystemExit("no page has a usable embedding; nothing to analyse")
 
-    def _atomic(path, writer):
-        tmp = path + ".tmp"
-        writer(tmp)
-        os.replace(tmp, path)
-    # Commit everything only after embedding succeeded.
-    _atomic(cv_path, lambda t: np.save(open(t, "wb"), C))
-    _atomic(ck_path, lambda t: json.dump(hashes, open(t, "w")))
-    _atomic(os.path.join(a.out, "vectors.npy"), lambda t: np.save(open(t, "wb"), V))
-    _atomic(os.path.join(a.out, "vectors.keys.json"), lambda t: json.dump([r["final"] for r in pages], open(t, "w")))
-    _atomic(os.path.join(a.out, "vectors.meta.json"), lambda t: json.dump(
-        {"model": a.model, "chunks": a.chunks, "boilerplate": a.boilerplate, "boilerplate_min_pages": 20, "docs": len(docs)}, open(t, "w")))
-    vn = np.linalg.norm(V, axis=1, keepdims=True)
-    V = V / np.where(vn == 0, 1, vn)
+    def _atomic(path, writer, mode="w"):
+        atomic_write(path, writer, binary="b" in mode)
+    used = sorted(set(h for h in hashes if h in cache))
+    _atomic(cz_path, lambda f: np.savez(f, keys=np.array(used, dtype=str),
+                                         vecs=np.array([cache[h] for h in used], dtype=np.float32).reshape(len(used), dim)), "wb")
+    # vectors.npz carries the page vectors, their URLs and a generation id;
+    # focus.json, written last, carries the same id, so a reader can tell an
+    # interrupted run from a complete one.
+    generation = hashlib.sha1(("\n".join(r["final"] for r in pages) + "\x00" + V.tobytes().hex()[:4096] + str(time.time())).encode()).hexdigest()[:16]
+    _atomic(os.path.join(a.out, "vectors.npz"), lambda f: np.savez(f, vecs=V,
+            keys=np.array([r["final"] for r in pages], dtype=str), generation=np.array(generation)), "wb")
+    V = V / vn[:, None]
 
     idx = np.array([r["indexable"] for r in pages])
     if not idx.any():
@@ -275,9 +320,10 @@ def main():
     rows = [{"url": r["final"], "section": s, "indexable": bool(ok), "nofollow_page": bool(r.get("nofollow_page")), "title": r.get("title", "")[:140],
              "h1": r.get("h1", "")[:140], "main_words": w, "distance": round(float(d), 4), "cluster": int(l)}
             for r, s, ok, w, d, l in zip(pages, secs, idx, main_words, dist, lab_all)]
-    json.dump(rows, open(os.path.join(a.out, "pages.json"), "w"))
+    _atomic(os.path.join(a.out, "pages.json"), lambda f: json.dump(rows, f))
     res = {
-        "model": a.model, "chunks": a.chunks, "boilerplate_share": a.boilerplate, "boilerplate_cut": int(cut), "clusters_used": k_used,
+        "generation": generation, "model": a.model,
+        "embedding_server_local": (urlsplit(a.ollama).hostname or "") in ("localhost", "127.0.0.1", "::1"), "chunks": a.chunks, "boilerplate_share": a.boilerplate, "boilerplate_cut": int(cut), "clusters_used": k_used,
         "pages_fetched_ok": len(pages), "pages_indexable": int(idx.sum()),
         "boilerplate_blocks_removed": sum(1 for b, n in freq.items() if n > cut),
         "site": {"focus": round(focus, 3), "radius_median": round(float(np.median(dist_i)), 3),
@@ -289,8 +335,11 @@ def main():
         "most_on_focus": sorted([x for x in rows if x["indexable"]], key=lambda x: x["distance"])[:25],
         "caveat": "Proxy for leaked attribute names; Google's actual formula, model and use are not public.",
     }
-    json.dump(res, open(os.path.join(a.out, "focus.json"), "w"), indent=1)
     np.save(os.path.join(a.out, "site_centroid.npy"), c)
+    _atomic(os.path.join(a.out, "focus.json"), lambda f: json.dump(res, f, indent=1))
+    for old in ("chunks.npy", "chunks.keys.json", "vectors.npy", "vectors.keys.json", "vectors.meta.json"):
+        if os.path.exists(os.path.join(a.out, old)):  # the 1.4 layout
+            os.remove(os.path.join(a.out, old))
     print(json.dumps(res["site"]), f"{len(pages)} pages, {int(idx.sum())} indexable")
 
 

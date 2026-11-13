@@ -23,6 +23,7 @@ import json
 import os
 import shutil
 import sys
+import urllib.parse
 import urllib.request
 
 COMMANDS = {"crawl": "site_crawl", "embed": "site_focus", "plan": "link_plan", "report": "focus_report"}
@@ -101,12 +102,20 @@ def run(argv):
     a = ap.parse_args(argv)
     w = lambda *p: os.path.join(a.out, *p)
     os.makedirs(a.out, exist_ok=True)
-    if not a.gsc and not a.no_gsc:
-        a.gsc = _gsc_for_run(a, w("gsc-pages.csv"))
+    use_gsc = not a.gsc and not a.no_gsc and _gsc_connect()
     crawl = ["--start", a.start, "--out", w("crawl"), "--max-pages", str(a.max_pages)] + (["--fresh"] if a.fresh else [])
     for s in a.sitemap:
         crawl += ["--sitemap", s]
     _run("site_crawl", crawl)
+    # Search Console is read after the crawl, for the host the start URL
+    # actually resolved to (example.com -> www.example.com).
+    try:
+        with open(w("crawl", "meta.json")) as f:
+            final = json.load(f).get("start_final") or a.start
+    except (OSError, ValueError):
+        final = a.start
+    if use_gsc:
+        a.gsc = _gsc_for_run(a, final, w("gsc-pages.csv"))
     _run("site_focus", ["--pages", w("crawl", "pages.jsonl"), "--out", w("embed"), "--k", str(a.k), "--chunks", str(a.chunks)])
     plan = ["--crawl", w("crawl"), "--focus", w("embed"), "--priority", a.priority, "--out", w("plan")]
     if a.gsc:
@@ -118,7 +127,7 @@ def run(argv):
     if a.anchor_model:
         plan += ["--anchor-model", a.anchor_model]
     _run("link_plan", plan)
-    host = a.start.split("://", 1)[-1].split("/")[0]
+    host = urllib.parse.urlsplit(final).netloc
     rep = ["--focus", w("embed"), "--plan", w("plan"), "--site", host, "--out", w("report", "index.html")]
     if a.notes:
         rep += ["--notes", a.notes]
@@ -127,8 +136,9 @@ def run(argv):
     return 0
 
 
-def _gsc_for_run(a, out_csv):
-    """Use connected Search Console data, or ask the user to connect."""
+def _gsc_connect():
+    """True if Search Console is connected; otherwise ask the user to connect
+    (before the long crawl, so nobody has to wait for the prompt)."""
     from sitefocus import gsc
     if not gsc.credentials():
         print("\n" + gsc.HOW_TO_CONNECT)
@@ -138,16 +148,23 @@ def _gsc_for_run(a, out_csv):
                 gsc.login(os.path.expanduser(ans))
         if not gsc.credentials():
             print("Continuing without Search Console: no traffic estimate, no near wins, no protected pages.\n")
-            return None
+            return False
+    return True
+
+
+def _gsc_for_run(a, start, out_csv):
+    """Pull Search Console page data for the crawled site (start is the
+    resolved start URL)."""
+    from sitefocus import gsc
     try:
-        site = a.gsc_site or gsc.pick_site(a.start, [s for s, _ in gsc.sites()])
+        site = a.gsc_site or gsc.pick_site(start, [s for s, _ in gsc.sites()])
     except SystemExit as ex:
         print(f"Search Console unavailable ({str(ex).splitlines()[0]}); continuing without it.")
         return None
     if not site:
-        print(f"No Search Console property you can read covers {a.start}; continuing without it. Use --gsc-site to choose one.")
+        print(f"No Search Console property you can read covers {start}; continuing without it. Use --gsc-site to choose one.")
         return None
-    host = a.start.split("://", 1)[-1].split("/")[0].split(":")[0]
+    host = urllib.parse.urlsplit(start).hostname
     info = gsc.pull_pages(site, a.gsc_days, out=out_csv, host=host)
     print(f"Search Console: {info['pages']:,} pages, {info['clicks']:,} clicks, {info['start']} to {info['end']} ({site})")
     return out_csv if info["pages"] else None

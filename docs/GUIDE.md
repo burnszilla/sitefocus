@@ -95,7 +95,7 @@ Site owners should be able to reach whoever is crawling them:
 export SITEFOCUS_CONTACT=you@yourcompany.com
 ```
 
-This goes into the crawler's User-Agent: `Mozilla/5.0 (compatible; sitefocus/1.0; +mailto:you@yourcompany.com)`.
+This goes into the crawler's User-Agent: `Mozilla/5.0 (compatible; sitefocus/1.0; +mailto:you@yourcompany.com)`. In robots.txt the crawler answers to `User-agent: sitefocus`: a group for `sitefocus` wins over `*`, and a group for `Mozilla` does not apply. `Crawl-delay` may be a decimal (for example `0.5`); values that are not a number, negative or infinite are ignored, and a delay above 600 seconds stops the crawl (for the start host) or skips that host, rather than crawling faster than asked.
 
 ### Check everything
 
@@ -126,12 +126,12 @@ open work/example/report/index.html        # macOS; use your browser elsewhere
 
 What happens:
 
-1. **Crawl.** robots.txt is read first and obeyed, including `Crawl-delay`. The crawler seeds from the home page and every URL in the sitemap (sitemap indexes are followed), then follows internal links. Requests to the site are spaced at least half a second apart across all workers (at most 2 a second), or the robots.txt `Crawl-delay` if that is longer.
-2. **Embed.** Each page's title, H1 and main text go to the local model. Text that repeats on more than 15% of pages (navigation, footers, cookie banners) is removed first. Long pages are read in up to three windows and averaged.
-3. **Plan.** Internal PageRank, harmonic centrality, the page map, link hygiene (rechecked live), and the linking plan with its simulations.
+1. **Crawl.** robots.txt is read before any page and obeyed, including `Crawl-delay`, for every request: pages, every redirect hop and sitemaps. The crawler seeds from the home page and every URL in the sitemap (sitemap indexes are followed), then follows internal links. Requests to the site are spaced at least half a second apart across all workers (at most 2 a second), or the robots.txt `Crawl-delay` if that is longer.
+2. **Embed.** Each page's title, H1 and main text go to the local model. Text that repeats on more than 15% of pages (`--boilerplate`), and on more than 20 pages in any case, is removed first (navigation, footers, cookie banners); on a site of 20 pages or fewer nothing is removed. Long pages are read in up to three windows and averaged.
+3. **Plan.** Internal PageRank, harmonic centrality, the page map, link hygiene (links to redirect, broken and rate-limited targets are rechecked live, up to 200 targets), and the linking plan with its simulations.
 4. **Report.** `index.html` plus CSV files.
 
-Everything is resumable. Run the same command again after an interruption and finished work is reused; pages that failed are retried. To measure changes you have shipped, run with `--fresh`: the old crawl is kept beside the new one in `crawl/previous-<time>/`.
+Everything is resumable. Run the same command again after an interruption and finished work is reused; pages that failed with an error, a 429 or a 5xx are tried again. If a crawl worker fails unexpectedly the command stops with an error rather than reporting a partial crawl as complete. To measure changes you have shipped, run with `--fresh`: the old crawl is kept beside the new one in `crawl/previous-<time>/`.
 
 ---
 
@@ -150,7 +150,7 @@ Everything is resumable. Run the same command again after an interruption and fi
 
 - Every page on the site (then nothing is "off topic")
 - Only the home page (too narrow; everything looks off topic)
-- Pages that are noindexed, canonicalised elsewhere or redirect (they are dropped; the tool tells you if none remain)
+- Pages that are noindexed or canonicalised elsewhere (they are dropped; the tool tells you if none remain). A priority URL that redirects is fine: it is matched to the page it redirects to, as long as the crawl saw that redirect (including the start URL's own redirect, `example.com` to `www.example.com`).
 
 **Why this matters.** Without an anchor, a "site centre" computed from all pages is set by whatever the site has most of. On a site where most pages are templated directory listings, that centre is "directory listing", and the editorial library looks like the least on-topic content. Anchoring on priority pages measures focus against what the site is for. The report still shows the plain measure for comparison.
 
@@ -171,7 +171,7 @@ Both are optional. Both make the plan much better.
 With Search Console data sitefocus:
 
 - **protects** pages that earn the most clicks (they are never taken out of sitewide slots),
-- **targets near wins:** on-topic pages ranking 4 to 20 with above-median impressions get links first,
+- **targets near wins:** on-topic pages ranking 4 to 20 with above-median impressions get links right after the orphaned priority pages,
 - **estimates traffic:** a what-if range of extra clicks if strengthened pages gain 1 to 3 positions,
 - adds clicks, impressions and position to `pages.csv`.
 
@@ -198,9 +198,9 @@ sitefocus gsc-status
 sitefocus gsc-sites
 ```
 
-During `run`, sitefocus picks the property that covers your start URL (the longest matching URL-prefix property, otherwise the domain property) and pulls the last 90 days ending 3 days ago (Search Console data lags). Override with `--gsc-site` and `--gsc-days`. On a domain property, rows are filtered to the crawled host.
+During `run`, sitefocus asks you to connect before the crawl, then, once the crawl has found the host the start URL resolves to, picks the property that covers that URL (the longest matching URL-prefix property, otherwise the domain property) and pulls the last 90 days ending 3 days ago (Search Console data lags). Override with `--gsc-site` and `--gsc-days`. On a domain property, rows are filtered to that host.
 
-**Privacy:** sitefocus ships with no credentials. The refresh token is stored only on your machine in `~/.config/sitefocus/gsc.json`, readable only by you, and used only to call Google's API. Disconnect with `rm ~/.config/sitefocus/gsc.json` and https://myaccount.google.com/permissions.
+**Privacy:** sitefocus ships with no credentials. With `gsc-login` the refresh token is stored only on your machine in `~/.config/sitefocus/gsc.json`, readable only by you, and used only to call Google's API. With gcloud, sitefocus reads gcloud's own login and stores nothing. Disconnect with `rm ~/.config/sitefocus/gsc.json` and https://myaccount.google.com/permissions.
 
 **Prefer a file?** Export Performance, Pages, last 3 months from Search Console and pass `--gsc pages.csv`. The columns are matched by name (`Top pages` or `Page`, `Clicks`, `Impressions`, `Position`).
 
@@ -228,9 +228,9 @@ sitefocus run https://www.example.com/ \
 
 **Time and load.** Requests are spaced at least `--delay` seconds apart (default 0.5) across all workers, so expect up to 2 pages a second, about 45 to 60 minutes for 5,000 pages. Embedding runs at roughly 150 to 300 page windows a minute on an Apple Silicon Mac. Run it in the background (`nohup ... &` or a terminal multiplexer) for large sites.
 
-**Be a good guest.** robots.txt rules and `Crawl-delay` are obeyed, and robots.txt is read before any page is requested. A 429 or 503 pauses every worker and retries (honouring `Retry-After`, else 30 seconds, then 60). If robots.txt returns 401 or 403 the crawl stops (the site is blocking it); if it returns 429 or a server error three times, the crawl also stops rather than guessing what is allowed. Redirects are followed only while they stay on the site and are allowed by robots.txt. Responses larger than 5 MB are cut off. Tell the site owner or your client before crawling large sites, and crawl staging if production is fragile.
+**Be a good guest.** robots.txt rules and `Crawl-delay` are obeyed (as `User-agent: sitefocus`, else `*`), and robots.txt is read before any page is requested. Rules are kept per scheme, host and port: an `http://` link on an `https://` site is checked against the `http://` robots.txt, read the first time it is needed; if that file cannot be read, nothing on that origin is fetched. Every 429 or 503, including the last retry, pauses every worker (honouring `Retry-After`, else 30, 60, then 90 seconds); a page that gets one is tried three times, and other errors are tried again on the next resume. A start URL that keeps returning 429 or a server error stops the run. If robots.txt returns 401 or 403 the crawl stops (the site is blocking it); if it returns 429 or a server error three times, or the connection fails (also after a redirect), the crawl also stops rather than guessing what is allowed. More than five redirects count as no robots.txt, as RFC 9309 allows. Page and sitemap redirects are followed only while they stay on the site and are allowed by robots.txt, and each hop is checked before it is requested. The start URL may redirect to another host (that is how the crawl finds `www.example.com`), but that host's robots.txt is read and must allow the target before it is requested. A robots.txt that redirects to another host is not followed and counts as no robots.txt, as RFC 9309 allows. A sitemap you pass may sit on another host, and that host's robots.txt must allow it; nested sitemaps must be on the crawl host or the exact host and port of a sitemap you passed. Responses larger than 5 MB are cut off. Tell the site owner or your client before crawling large sites, and crawl staging if production is fragile.
 
-**Scope.** The crawl stays on the host and port the start URL resolves to (if `example.com` redirects to `www.example.com`, it crawls `www.example.com`). Query strings are dropped by default, so `?sort=` and `?page=` variants collapse into one URL and faceted navigation cannot trap the crawler; use `--keep-query` (on the `crawl` step) for sites where query URLs are real pages. Pages are decoded with their declared charset and `<base href>` is honoured. `--max-pages` caps the crawl (default 8,000).
+**Scope.** The crawl stays on the host and port the start URL resolves to (ports 80 and 443 count as one site, so http and https links both stay in) (if `example.com` redirects to `www.example.com`, it crawls `www.example.com`). Query strings are dropped by default, so `?sort=` and `?page=` variants collapse into one URL and faceted navigation cannot trap the crawler; use `--keep-query` (on the `crawl` step) for sites where query URLs are real pages. Pages are decoded with their declared charset (the HTTP header, quoted or not, else the meta tag, else UTF-8) and `<base href>` is honoured. Several meta robots tags on one page combine; a later `follow` never cancels an earlier `noindex`. All `X-Robots-Tag` headers count, and `none` means `noindex, nofollow`. A directive addressed to a named bot (`googlebot: noindex`) is applied too, the conservative reading for an analysis of how Google sees the site. `--max-pages` caps the crawl (default 8,000).
 
 **Steps one at a time.** Useful for reruns with different settings, since only the step you change has to run again:
 
@@ -249,7 +249,7 @@ Rerunning `plan` and `report` takes seconds, so experiment with `--template-weig
 
 ## 7. Read the report
 
-The report is one HTML file with no external dependencies. Sections in order:
+The report is `index.html` with its stylesheet `report.css` beside it, plus the CSV files; it loads nothing from the internet (no chart library, no fonts). Keep the folder together when you share it. Sections in order:
 
 ### Estimated impact if every change ships
 
@@ -289,11 +289,11 @@ Each scenario simulated on the full link graph, with charts and a table:
 | --- | --- |
 | Contextual links | The recommended links added in body copy |
 | Links + flagged swap | Plus flagged sitewide slots reassigned to orphaned priority pages |
-| Links + related-products module | Plus every page in the largest editorial section linking to its three closest priority pages |
+| Links + related-products module | Plus every page in one editorial section (the largest section of at least 50 pages that is not a big directory, or `--module-section`) linking to up to three of its closest priority pages; pages marked nofollow are left out |
 | Links + sitewide content slots | Plus the least on-topic sitewide content links pointed at the weakest priority pages |
 | Every change together | All of the above |
 
-The usual lesson: sitewide navigation and footer links carry most internal PageRank, so changing a handful of sitewide slots moves more than thousands of contextual links. The table's "Check first" column says when a scenario needs traffic data before you act on it.
+A common pattern, not a rule: sitewide navigation and footer links carry most internal PageRank, so changing a handful of sitewide slots can move more than thousands of contextual links. Read your own numbers in the table. The table's "Check first" column says when a scenario needs traffic data before you act on it.
 
 ### Search Console (if connected)
 
@@ -329,7 +329,7 @@ PageRank says how much link weight flows in; harmonic centrality says how easily
 
 ### Link hygiene
 
-Internal links to redirects, broken pages and noindexed or canonicalised pages; internal nofollow; pages with meta robots nofollow (their links pass nothing); and sign-in, account or cart links. Every redirect, broken and rate-limited target is fetched again live before it is reported, so a crawl hiccup does not become a false finding.
+Internal links to redirects, broken pages and noindexed or canonicalised pages; internal nofollow; pages with meta robots nofollow (their links pass nothing); and sign-in, account or cart links. Links to redirect, broken and rate-limited targets are fetched again live before they are reported (up to 200 targets, most-linked first, robots.txt obeyed, skipped with `--no-recheck`), so a crawl hiccup does not become a false finding. Noindexed and uncrawled targets are reported from the crawl as is.
 
 ### Where nofollow belongs
 
@@ -369,7 +369,7 @@ All in `<out>/report/` (and `<out>/plan/`). Open them in a spreadsheet and filte
 | priority | 1 if in priority.txt |
 | linking_pages | Distinct internal pages linking to it |
 | depth | Clicks from the home page (blank: unreachable) |
-| pagerank, pagerank_after | Raw internal PageRank (sums to 1 across the site) |
+| pagerank, pagerank_after | Internal PageRank, normalised to sum to 1 across the site. Nofollowed links discard part of the raw total; `plan.json` reports that raw total as `nofollow_model.retained_mass` |
 | external_linking_sites | From the backlink export |
 | clicks, impressions, position | From Search Console |
 | protected, near_win | 1 if protected from swaps, or a near win |
@@ -386,17 +386,21 @@ All in `<out>/report/` (and `<out>/plan/`). Open them in a spreadsheet and filte
 | paragraph | The paragraph on the source page that best matches the target |
 | instruction | One line a content editor can follow |
 
-Links are suggested in this order: orphaned priority pages, then near wins, then priority pages, then underlinked pages, strongest source pages first. Pages marked nofollow are never suggested as sources. At most three new links per source page, never between near-duplicates, except parent-hub links to orphaned pages (one per orphan, so a hub can get more).
+Links are suggested in this order: orphaned priority pages (a link from the parent hub, then up to eight of the most similar pages), then near wins, then priority pages, then underlinked pages; in the last three phases the strongest source pages go first. Pages marked nofollow are never suggested as sources, and no link is ever suggested between near-duplicates. Exceptions for orphaned priority pages, which need links most: the parent-hub link ignores the per-page cap and `--min-sim`, and the similar-page links ignore `--min-sim` (they still count toward the cap). Orphan links are allocated first, so they can use up a source page's cap before the later phases.
 
 How anchors are chosen: the paragraph must share at least one distinctive word with the target (a word on fewer than 10% of pages), must be prose (8 words or more, no `|` separators), and the anchor is 2 to 6 words from that paragraph containing at least one distinctive word, never spanning a sentence break or starting or ending on a filler word. When nothing fits, the instruction says to add a sentence, and the anchor is the target's cleaned title. `--anchor-model qwen3:8b` asks a local model for anchors on orphan and priority links where no phrase fits; only words that really appear in the paragraph are kept.
 
 ### sitewide.csv
 
-Every page linked from at least half the site, with its topic score, PageRank share, a flag (single directory entry, campaign page, stale, leak), whether it is in the swap or slot scenario, and Search Console clicks if connected.
+Every page linked from at least the `--template-share` of the site (default half), with its topic score, PageRank share, a flag (single directory entry, campaign page, stale, leak), whether it is in the swap or slot scenario, and Search Console clicks if connected.
 
 ### execution/
 
-One CSV per step of the execution guide, numbered to match the report. Hand each file to whoever owns that change.
+A CSV for each step of the execution guide that has rows to work from, numbered to match the report (the baseline, module test and recrawl steps have none). Hand each file to whoever owns that change. Regenerating the report replaces only the files listed in `execution/.sitefocus-manifest.json` from the previous run; anything else you keep there is never touched.
+
+### Raw crawl files
+
+`crawl/pages.jsonl` and `crawl/edges.csv` are the tool's own working data and keep anchors and titles exactly as crawled, so a cell can start with `=` or `+`. Do not open them in a spreadsheet; use the CSV files in the report and plan folders, where every text cell is made safe for spreadsheets.
 
 ### hygiene.csv (plan folder)
 
@@ -412,7 +416,7 @@ The execution guide in the report is the order. In practice:
 2. **Link hygiene first.** Usually template edits, so one change fixes thousands of links. Point redirecting links at their final URL. Keep links people need (site search, sign-in) but keep them out of body copy.
 3. **Orphaned priority pages.** Parent hub link first, then similar pages. Request indexing in URL Inspection.
 4. **Flagged sitewide swap.** Needs business sign-off; someone put those links there on purpose.
-5. **Contextual links** to priority pages, then near wins, then underlinked pages. Batches of a few hundred, section by section. Use `link_adds.csv` instructions; skip any link that would not help a reader.
+5. **Contextual links** to near wins, then priority pages, then underlinked pages. Batches of a few hundred, section by section. Use `link_adds.csv` instructions; skip any link that would not help a reader.
 6. **Optional module test** on a tenth of the editorial section.
 7. **Sitewide content slots** last, one or two at a time, only after checking the traffic of every page that would lose a slot.
 8. **Near-duplicates:** consolidate, differentiate or canonicalise after checking each page's queries.
@@ -429,15 +433,15 @@ The execution guide in the report is the order. In practice:
 
 ## 10. How the numbers are calculated
 
-**Page vectors.** nomic-embed-text over `title + H1 + main text`, in up to three 5,500-character windows averaged, after removing text blocks found on more than 15% of pages. Vectors are unit-normalised.
+**Page vectors.** nomic-embed-text over `title + H1 + main text`, in up to three 5,500-character windows averaged, after removing text blocks found on more than `max(20, 15% of pages)` pages. Vectors are unit-normalised. A page whose embedding comes back empty or invalid is left out with a warning.
 
 **Topic.** The anchor is the mean of the priority pages' vectors, normalised. Topic = percentile of `cos(page, anchor)` among indexable pages (0 to 100, ties averaged).
 
-**Internal PageRank.** Damping 0.85, one edge per source-target pair, indexable same-host pages only. Navigation, footer and sitewide links (targets linked from at least half the pages, or links outside body copy) weigh `--template-weight` (default 0.5) of a body link, a reasonable-surfer approximation. A nofollowed link, and every link on a page with meta robots or X-Robots-Tag nofollow, still takes its share of the page's PageRank and that share is discarded, as Google has done since 2009. Harmonic centrality and click depth follow followed links only. Dangling pages redistribute through the teleport vector. With `--backlinks`, the teleport vector is `1 + sqrt(linking sites)` per page, normalised, so external equity enters where it lands.
+**Internal PageRank.** Damping 0.85, one edge per source-target pair, indexable same-host pages only. Navigation, footer and sitewide links (targets linked from at least `--template-share` of the pages, default half, or links outside body copy) weigh `--template-weight` (default 0.5) of a body link, a reasonable-surfer approximation. A nofollowed link, and every link on a page with meta robots or X-Robots-Tag nofollow, still takes its share of the page's PageRank and that share is discarded, as Google has done since 2009. Each scenario computes this from its own links: if a scenario adds a followed link where a nofollowed one existed, it is no longer discarded. Links to pages outside the model (other sites, noindexed and uncrawled pages) are left out, followed and nofollowed alike. Harmonic centrality and click depth follow followed links only. Dangling pages redistribute through the teleport vector. With `--backlinks`, the teleport vector is `1 + sqrt(linking sites)` per page, normalised, so external equity enters where it lands.
 
 **Links score.** Percentile of internal PageRank.
 
-**Link Focus Score.** `sum(PageRank_i x Topic_i)` with PageRank summing to 1. Range 0 to 100.
+**Link Focus Score.** `sum(PageRank_i x Topic_i)` with PageRank normalised to sum to 1. Range 0 to 100. Every share in the report (priority pages, groups, sections) uses the same normalised PageRank, so section contributions add up to the score.
 
 **Harmonic centrality (reach).** `HC(v) = sum over u != v of 1 / d(u, v)`, divided by `n - 1`, where `d` is the shortest link path and unreachable pairs add 0. Computed exactly by breadth-first search from 64 sources at a time using bitsets.
 
@@ -480,16 +484,16 @@ The execution guide in the report is the order. In practice:
 
 ### sitefocus embed
 
-`--pages`, `--out`, `--ollama`, `--model` (nomic-embed-text), `--k`, `--chunks`, `--boilerplate` (0.15, share of pages a text block can appear on before it is treated as boilerplate).
+`--pages`, `--out`, `--ollama`, `--model` (nomic-embed-text), `--k`, `--chunks`, `--boilerplate` (0.15, share of pages a text block can appear on before it is treated as boilerplate; never fewer than 20 pages).
 
 ### sitefocus plan
 
 | Option | Default | What it does |
 | --- | --- | --- |
-| `--adds-per-page` | 3 | Maximum new links per source page |
+| `--adds-per-page` | 3 | Maximum new links per source page (parent-hub links to orphaned pages are exempt) |
 | `--max-new-inlinks` | 150 | Maximum new links per target page |
-| `--min-sim` | 0.72 | Minimum similarity for a recommended link |
-| `--near-dup` | 0.97 | Pages this similar are never linked to each other |
+| `--min-sim` | 0.72 | Minimum similarity for a recommended link (orphan links are exempt) |
+| `--near-dup` | 0.97 | Pages this similar are never linked to each other by a recommendation |
 | `--template-share` | 0.5 | Share of pages linking to a target for it to count as sitewide |
 | `--template-weight` | 0.5 | Weight of template links relative to body links |
 | `--slots` | 10 | Sitewide content slots in the slot scenario |
@@ -520,7 +524,11 @@ The execution guide in the report is the order. In practice:
 | Many 429s or a slow crawl | The site rate-limits. Lower `--workers` to 1 and raise `--delay`. |
 | `Ollama ... NOT REACHABLE` | Start Ollama (`ollama serve`) or set `SITEFOCUS_OLLAMA`. |
 | Embedding stalls | The model server is busy. sitefocus times out a stuck request after 20 seconds, splits the batch and retries; progress is saved, so rerun to resume. |
-| `none of the priority URLs were crawled as indexable pages` | Priority URLs redirect, are noindexed, canonicalised elsewhere, blocked, or not linked and not in the sitemap. Fix the list. |
+| `... is incomplete or from an interrupted run` | The embed step was interrupted while writing its files. Run the embed step (or `sitefocus run`) again; cached chunks are reused. |
+| `N pages have no usable embedding` | The model returned empty vectors for those pages (often pages with almost no text). They are left out of the analysis. |
+| `crawl stopped: a worker failed` | An unexpected error inside the crawler. What was fetched is kept; rerun to resume, and report the error if it repeats. |
+| `RuntimeWarning: divide by zero encountered in matmul` | Observed on macOS with numpy 2.0.2 (the newest numpy for Python 3.9) and Apple's Accelerate library on clean, finite vectors, where the results were finite and correct. sitefocus checks its vectors for invalid values itself and stops or drops pages if any appear. Python 3.10 or later with a current numpy did not show it. |
+| `none of the priority URLs were crawled as indexable pages` | Priority URLs are noindexed, canonicalised elsewhere, blocked, redirect somewhere the crawl never saw, or are not linked and not in the sitemap. Fix the list. |
 | Search Console: `do not include Search Console access` | Your gcloud login lacks the scope. Use the gcloud command in section 5 or `gsc-login`. |
 | Search Console: `No property you can read covers ...` | Your Google account has no access to that property, or the property is for another host. `sitefocus gsc-sites` lists what you can read; pick one with `--gsc-site`. |
 | Traffic says "not enough Search Console data" | Fewer than 6 positions have enough pages. Common on small sites; nothing to fix. |
@@ -546,7 +554,7 @@ Not by itself. It means internal equity is concentrated on the pages you care ab
 It has been run on about 5,000 pages and 440,000 internal links, where crawl, plan and report finish comfortably. Harmonic centrality takes seconds at 20,000 pages, and duplicate checks run in blocks so memory stays bounded. Larger sites work but take longer to crawl and embed; split very large sites by section with separate priority lists.
 
 **Does any data leave my machine?**
-Crawled pages go only to your Ollama server. Search Console calls go only to Google's API with your own credentials. Nothing else is sent anywhere.
+Crawled page text goes only to the Ollama server you configure (localhost by default; another machine if you set `SITEFOCUS_OLLAMA`). Search Console calls go to Google's API with your own credentials (the endpoints can be overridden by environment variables, which the tests use). Nothing else is sent anywhere.
 
 **Can I run it on a JavaScript-rendered site?**
 It reads server HTML. If the site's content and links are only in the rendered DOM, results will be wrong; prerender, or make links crawlable in the HTML (good for every crawler, not just this one).
