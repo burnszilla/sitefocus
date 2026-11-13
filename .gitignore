@@ -4,3 +4,8 @@ build/
 dist/
 work/
 .DS_Store
+# credentials never belong in this repo
+gsc.json
+client_secret*.json
+*token*.json
+.env

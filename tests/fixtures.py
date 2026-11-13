@@ -146,3 +146,52 @@ def fake_ollama():
     srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
+
+
+def fake_google(pages=30000, scope="https://www.googleapis.com/auth/webmasters.readonly"):
+    """Fake OAuth token endpoint and Search Console API. Serves `pages` rows
+    so pagination past 25,000 is exercised."""
+    state = {"queries": []}
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _json(self, obj, code=200):
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path.endswith("/sites"):
+                self._json({"siteEntry": [{"siteUrl": "sc-domain:example.com", "permissionLevel": "siteOwner"},
+                                          {"siteUrl": "https://shop.example.com/", "permissionLevel": "siteFullUser"},
+                                          {"siteUrl": "https://other.org/", "permissionLevel": "siteOwner"}]})
+            else:
+                self._json({}, 404)
+
+        def do_POST(self):
+            raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            if self.path.endswith("/token"):
+                self._json({"access_token": "fake-token", "expires_in": 3600, "scope": scope, "token_type": "Bearer"})
+                return
+            if "searchAnalytics" in self.path:
+                if self.headers.get("Authorization") != "Bearer fake-token":
+                    self._json({"error": "unauthorized"}, 401)
+                    return
+                q = json.loads(raw)
+                state["queries"].append(q)
+                start, limit = q["startRow"], q["rowLimit"]
+                n = max(0, min(limit, pages - start))
+                rows = [{"keys": [f"https://www.example.com/p{start + i}/"], "clicks": 2, "impressions": 100, "ctr": 0.02, "position": 7.5}
+                        for i in range(n)]
+                self._json({"rows": rows} if rows else {})
+                return
+            self._json({}, 404)
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    srv.state = state
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv

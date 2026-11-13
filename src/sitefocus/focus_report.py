@@ -111,7 +111,7 @@ def main():
             ("Link Focus Score", arrow(I["lfs"][0], I["lfs"][1]), f"{I['lfs'][1] - I['lfs'][0]:+.1f} points"),
             ("Priority pages' share of internal PageRank", arrow(*I["priority_share"], fmt=pct), f"{mult:.2f}x"),
             ("Orphaned priority pages", arrow(*I["orphans"]), "linked into the site" if I["orphans"][1] < I["orphans"][0] else ""),
-            ("Reach of the weakest priority page", arrow(*I["priority_reach_min"]), "1.0 = one click from every page"),
+            ("Harmonic centrality (reach) of the weakest priority page", arrow(*I["priority_reach_min"]), "1.0 = one click from every page"),
             ("Pages in the Stars group", arrow(*I["stars"], fmt=lambda v: f"{v:,}"), "on topic and well linked"),
         ]
         T = I.get("traffic") or {"available": False, "reason": "no Search Console export (--gsc)"}
@@ -324,21 +324,22 @@ def main():
 
     R = P.get("reach")
     if R:
-        o.append("<h2>Reach: how woven into the site each page is</h2>")
-        o.append("<p>Reach is internal harmonic centrality: the average of 1 ÷ clicks from every other page. 1.0 means one click from every page, 0.5 about two clicks, 0 unreachable by links. "
+        o.append("<h2>Harmonic centrality (reach): how woven into the site each page is</h2>")
+        o.append("<p>Harmonic centrality, called reach in this report, is the average of 1 ÷ clicks from every other page on the site. 1.0 means one click from every page, 0.5 about two clicks, 0 unreachable by links. "
+                 "It is the same measure Common Crawl uses to rank whole hosts and domains on the web, computed here inside the site, page by page, on the crawled link graph (exact, not estimated). "
                  "PageRank says how much link weight flows in; reach says how easily the rest of the site gets there. "
                  f"On this site the two agree only moderately (rank correlation {R['spearman_links']}), so reach adds information.</p>")
         o.append(table(["", "Now", "After the links"], [
-            ["Median reach, priority pages", R["priority_reach_median"][0], R["priority_reach_median"][1]],
-            ["Median reach, all pages", R["site_reach_median"][0], R["site_reach_median"][1]]]))
+            ["Median harmonic centrality, priority pages", R["priority_reach_median"][0], R["priority_reach_median"][1]],
+            ["Median harmonic centrality, all pages", R["site_reach_median"][0], R["site_reach_median"][1]]]))
         low = sorted(R["priority"], key=lambda x: x["hc_now"])[:12]
-        o.append("<h3>Priority pages with the least reach</h3>")
-        o.append(table(["Priority page", "Reach now", "After the links", "Link score"], [[link(x["url"]), x["hc_now"], x["hc_after"], x["links"]] for x in low]))
+        o.append("<h3>Priority pages with the lowest harmonic centrality</h3>")
+        o.append(table(["Priority page", "Harmonic centrality now", "After the links", "Link score (PageRank)"], [[link(x["url"]), x["hc_now"], x["hc_after"], x["links"]] for x in low]))
         if R["links_ahead"]:
-            o.append("<h3>PageRank ahead of reach</h3><p>High link score, low reach: these pages are fed by a few strong links rather than woven into the site (the page-level version of Geraci's gap). One strong source changing would drop them. Give them more, ordinary contextual links from related pages.</p>")
+            o.append("<h3>PageRank ahead of harmonic centrality</h3><p>High link score, low reach: these pages are fed by a few strong links rather than woven into the site (the page-level version of Geraci's gap). One strong source changing would drop them. Give them more, ordinary contextual links from related pages.</p>")
             o.append(table(["Page", "Link score", "Reach score", "Pages linking to it"], [[link(x["url"]), x["links"], x["reach"], x["linking_pages"]] for x in R["links_ahead"][:12]]))
         if R["reach_ahead"]:
-            o.append("<h3>Reach ahead of PageRank</h3><p>Easy to reach but little link weight: linked from many weak pages. Links from stronger pages would help most.</p>")
+            o.append("<h3>Harmonic centrality ahead of PageRank</h3><p>Easy to reach but little link weight: linked from many weak pages. Links from stronger pages would help most.</p>")
             o.append(table(["Page", "Link score", "Reach score", "Pages linking to it"], [[link(x["url"]), x["links"], x["reach"], x["linking_pages"]] for x in R["reach_ahead"][:12]]))
 
     H = P.get("hygiene") or {}

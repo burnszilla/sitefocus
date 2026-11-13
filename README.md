@@ -30,7 +30,7 @@ pip install "git+https://github.com/burnszilla/sitefocus"
 Or from a release wheel (no network to GitHub needed): download it from the Releases page, then
 
 ```
-pip install sitefocus-1.2.0-py3-none-any.whl
+pip install sitefocus-1.3.0-py3-none-any.whl
 ```
 
 Ollama and one embedding model (about 270 MB):
@@ -63,9 +63,29 @@ open work/example/report/index.html
 
 The crawl obeys robots.txt and runs at about 1.5 pages a second (2 workers, half a second apart), backing off and retrying when a server rate-limits it. Crawl and embedding are both resumable: run the same command again to continue, and finished work is reused. A 5,000-page site takes about an hour to crawl and 10 to 20 minutes to embed.
 
+## Connect Search Console (recommended)
+
+`sitefocus run` asks you to connect if you have not. Once connected it finds the right property for the site and pulls clicks, impressions and position for every page on its own. Access is read-only.
+
+Option 1, an OAuth desktop client (works anywhere):
+
+1. Google Cloud Console, APIs & Services: enable **Google Search Console API**.
+2. Credentials, Create credentials, **OAuth client ID**, application type **Desktop app**, Download JSON.
+3. `sitefocus gsc-login --client-secret client_secret.json`. Your browser opens; approve read-only access once.
+
+Option 2, if you already use gcloud:
+
+```
+gcloud auth application-default login --scopes=https://www.googleapis.com/auth/webmasters.readonly,https://www.googleapis.com/auth/cloud-platform
+```
+
+Then `sitefocus gsc-status` and `sitefocus gsc-sites` to check. The Google account needs access to the site's Search Console property.
+
+**Privacy:** sitefocus ships with no credentials. You use your own Google OAuth client or gcloud login; the refresh token is stored only on your machine in `~/.config/sitefocus/gsc.json`, readable only by you. Nothing is sent anywhere except Google's own API. `rm ~/.config/sitefocus/gsc.json` and https://myaccount.google.com/permissions disconnect it.
+
 ## Better inputs, better decisions
 
-Both are optional and both are plain CSV exports, so nothing needs API access:
+Both are optional. Search Console data comes from the connection above, or from a CSV export if you prefer:
 
 - `--gsc pages.csv`: Search Console, Performance, Pages tab, last 3 months, Export. Pages that earn the most clicks are protected (never swapped out of sitewide slots); on-topic pages ranking 4 to 20 with above-median impressions become "near wins" that get links first; clicks, impressions and position are added to `pages.csv` and to the near-duplicate review.
 - `--backlinks links.csv`: Search Console, Links, Top linked pages (externally), Export; or an Ahrefs or Semrush "best by links" export. External links put PageRank into specific pages; with this file the model starts each page from its real external strength instead of treating every page equally.
@@ -132,7 +152,7 @@ sitefocus report --focus work/embed --plan work/plan --site example.com --out wo
 python -m unittest discover -s tests -v
 ```
 
-34 tests, offline: PageRank against an independent dense implementation, exact harmonic centrality against brute force, Search Console and backlink export parsing, link placement rules, and an end-to-end run against a local fixture site (robots.txt, sitemap-only orphan, redirects, 404, a page that rate-limits once, meta noindex, X-Robots-Tag, page-level nofollow, a JavaScript-only link) with a fake embedding server. GitHub Actions runs them on Python 3.9 and 3.13.
+38 tests, offline: PageRank against an independent dense implementation, exact harmonic centrality against brute force, Search Console and backlink export parsing, link placement rules, and an end-to-end run against a local fixture site (robots.txt, sitemap-only orphan, redirects, 404, a page that rate-limits once, meta noindex, X-Robots-Tag, page-level nofollow, a JavaScript-only link) with a fake embedding server, and the Search Console connection against a fake Google API (credentials, property choice, pagination past 25,000 rows, scope checks). GitHub Actions runs them on Python 3.9 and 3.13.
 
 ## Settings
 
@@ -141,6 +161,8 @@ python -m unittest discover -s tests -v
 | SITEFOCUS_CONTACT | none | your email, sent in the crawler's User-Agent |
 | SITEFOCUS_OLLAMA | http://localhost:11434 | Ollama server for embeddings |
 | SITEFOCUS_BACKOFF | 30 | seconds to wait after a 429 or 503 before retrying (doubles on the second retry) |
+| SITEFOCUS_GSC_CLIENT | none | path to your OAuth client_secret.json for `gsc-login` |
+| SITEFOCUS_CONFIG_DIR | ~/.config/sitefocus | where the Search Console token is stored |
 
 ## Claude Code
 

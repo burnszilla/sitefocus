@@ -10,7 +10,7 @@ Runs through the `sitefocus` CLI. If `sitefocus doctor` is not ready, fix what i
 ## Workflow
 
 1. Build `priority.txt`: the product or money pages, one URL per line. A product sitemap is a good source. Ask the user if unsure; the whole analysis is anchored on these pages.
-2. Ask for a Search Console Pages export (Performance, Pages, last 3 months) and, if available, the Links "Top linked pages" export. Then `sitefocus run <home URL> --sitemap <sitemap URL> --priority priority.txt --gsc pages.csv --backlinks links.csv --out <dir>`. Large sites take one to three hours (crawl plus embedding); run it in the background. It resumes if interrupted.
+2. Check `sitefocus gsc-status`. If not connected, ask the user to connect (`sitefocus gsc-login --client-secret client_secret.json`, or the gcloud command in the README); `run` pulls the data itself once connected. Never handle or store their credentials yourself. Ask for the Links "Top linked pages" export if available (the API has no links report). Then `sitefocus run <home URL> --sitemap <sitemap URL> --priority priority.txt --gsc pages.csv --backlinks links.csv --out <dir>`. Large sites take one to three hours (crawl plus embedding); run it in the background. It resumes if interrupted.
 3. Read `<dir>/plan/plan.json`, then `pages.csv`, `link_adds.csv` and `sitewide.csv` in `<dir>/report/`.
 4. Verify before claiming:
    - Orphaned priority pages: open the home page and the parent hub in a rendered browser (Playwright) and confirm the links are really absent. Menus can be client-side.

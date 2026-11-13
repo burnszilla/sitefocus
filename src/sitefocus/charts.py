@@ -224,7 +224,7 @@ SCRIPT = r"""<div class="tooltip" id="tt" role="status" aria-live="polite" hidde
     if (best < 0) { hide(); hl.setAttribute('cx', -20); return; }
     var d = data[best];
     hl.setAttribute('cx', d[0]); hl.setAttribute('cy', yOf(d));
-    show([d[3] || d[4], 'Topic ' + d[5] + ' · Links ' + (state === 'now' ? d[6] : d[7]) + (state === 'now' ? '' : ' (was ' + d[6] + ')') + (d[11] !== '' ? ' · Reach ' + d[11] : ''),
+    show([d[3] || d[4], 'Topic ' + d[5] + ' · Links ' + (state === 'now' ? d[6] : d[7]) + (state === 'now' ? '' : ' (was ' + d[6] + ')') + (d[11] !== '' ? ' · Harmonic centrality ' + d[11] : ''),
           'Group: ' + d[8] + (d[10] ? ' · priority page' : ''), '/' + d[9] + '/', d[4]], ev);
   });
   hit.addEventListener('pointerleave', function () { hide(); hl.setAttribute('cx', -20); });

@@ -130,7 +130,7 @@ class TestReport(unittest.TestCase):
     def test_sections_and_files(self):
         html = open(os.path.join(WORK, "report", "index.html"), encoding="utf-8").read()
         for s in ("Estimated impact if every change ships", "How to execute, in order", "Link hygiene",
-                  "Where nofollow belongs", "Reach:", "pagemap"):
+                  "Where nofollow belongs", "Harmonic centrality (reach)", "pagemap"):
             self.assertIn(s, html)
         ex = os.listdir(os.path.join(WORK, "report", "execution"))
         self.assertTrue(any("fix-link-hygiene" in f for f in ex))
