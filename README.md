@@ -32,7 +32,7 @@ pip install "git+https://github.com/burnszilla/sitefocus"
 Or from a release wheel (no network to GitHub needed): download it from the Releases page, then
 
 ```
-pip install sitefocus-1.4.0-py3-none-any.whl
+pip install sitefocus-1.4.1-py3-none-any.whl
 ```
 
 Ollama and one embedding model (about 270 MB):
@@ -154,7 +154,7 @@ sitefocus report --focus work/embed --plan work/plan --site example.com --out wo
 python -m unittest discover -s tests -v
 ```
 
-64 tests, offline: PageRank against an independent dense implementation, exact harmonic centrality against brute force, Search Console and backlink export parsing, link placement rules, and an end-to-end run against a local fixture site (robots.txt, sitemap-only orphan, redirects, 404, a page that rate-limits once, meta noindex, X-Robots-Tag, page-level nofollow, a JavaScript-only link) with a fake embedding server, and the Search Console connection against a fake Google API (credentials, property choice, pagination past 25,000 rows, scope checks), plus a regression test for every finding of an independent code review: hostile page titles, redirects off the site or into robots-blocked paths, robots.txt server errors, oversized pages, charsets, `<base href>`, damaged crawl files, cache staleness, nofollow modelling and CSV formula injection. GitHub Actions runs them on Python 3.9 and 3.13.
+65 tests, offline: PageRank against an independent dense implementation, exact harmonic centrality against brute force, Search Console and backlink export parsing, link placement rules, and an end-to-end run against a local fixture site (robots.txt, sitemap-only orphan, redirects, 404, a page that rate-limits once, meta noindex, X-Robots-Tag, page-level nofollow, a JavaScript-only link) with a fake embedding server, and the Search Console connection against a fake Google API (credentials, property choice, pagination past 25,000 rows, scope checks), plus a regression test for every finding of an independent code review: hostile page titles, redirects off the site or into robots-blocked paths, robots.txt server errors, oversized pages, charsets, `<base href>`, damaged crawl files, cache staleness, nofollow modelling and CSV formula injection. GitHub Actions runs them on Python 3.9 and 3.13.
 
 ## Settings
 

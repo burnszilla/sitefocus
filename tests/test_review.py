@@ -97,10 +97,28 @@ class TestCrawlScope(unittest.TestCase):
     def test_redirect_to_another_host_is_not_followed(self):  # finding: redirects escape scope
         self.assertEqual(_Recorder.hits, [])
 
-    def test_requests_are_spaced_across_workers(self):  # finding: per-worker throttling
-        t = sorted(x for x, p in MAIN_REQUESTS if p != "/robots.txt")
-        gaps = [b - a for a, b in zip(t, t[1:])]
-        self.assertGreaterEqual(min(gaps), 0.03)  # 0.05 s schedule; server-side timestamps jitter
+    def test_scheduler_spaces_workers(self):  # finding: per-worker throttling
+        gate = mod("site_crawl").Gate(0.05)
+        times, lock = [], threading.Lock()
+
+        def worker():
+            for _ in range(5):
+                gate.wait()
+                with lock:
+                    times.append(time.time())
+        ts = [threading.Thread(target=worker) for _ in range(3)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        times.sort()
+        gaps = [b - a for a, b in zip(times, times[1:])]
+        self.assertGreaterEqual(min(gaps), 0.045)  # released one at a time, 0.05 s apart
+
+    def test_crawl_rate_is_limited(self):  # end to end: 0.05 s schedule means at most ~20 requests a second
+        t = sorted(x for x, p in MAIN_REQUESTS)
+        rate = (len(t) - 1) / (t[-1] - t[0])
+        self.assertLessEqual(rate, 22)
 
     def test_paragraph_with_inline_markup_is_one_block(self):  # finding: parser splits paragraphs
         text = pages()[f"{BASE}/odd/inline/"]["text"]
