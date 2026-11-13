@@ -48,7 +48,7 @@ def _post(base, model, texts, timeout):
         return json.load(r)["embeddings"]
 
 
-def _robust(base, model, texts, timeout=120, tries=3):
+def _robust(base, model, texts, timeout=20, tries=3):
     for attempt in range(tries):
         try:
             return _post(base, model, texts, timeout)
@@ -61,17 +61,35 @@ def _robust(base, model, texts, timeout=120, tries=3):
             print(f"  retry single text after {ex}", flush=True)
 
 
-def embed(texts, base, model, batch=16, cache=None):
-    """Embed with retries; progress is checkpointed to cache (a .partial.json)."""
+def embed(texts, base, model, batch=16, cache=None, ids=None):
+    """Embed with retries. Progress is checkpointed to cache as {"ids", "vecs"};
+    a restart reuses every vector whose id (page URL + chunk number) still
+    matches, so a stalled or killed run never loses finished work."""
+    ids = ids or [str(i) for i in range(len(texts))]
     out = []
     if cache and os.path.exists(cache):
-        out = json.load(open(cache))
-        print(f"  resuming at {len(out)}", flush=True)
+        try:
+            saved = json.load(open(cache))
+            if isinstance(saved, dict):
+                k = 0
+                while k < len(saved["ids"]) and k < len(ids) and saved["ids"][k] == ids[k]:
+                    k += 1
+                out = saved["vecs"][:k]
+        except Exception:
+            out = []
+        print(f"  resuming at {len(out)} of {len(texts)}", flush=True)
+    import time as _t
+    t0 = _t.time()
     for i in range(len(out), len(texts), batch):
+        tb = _t.time()
         out += _robust(base, model, texts[i:i + batch])
-        if cache and (i // batch) % 10 == 0:
-            json.dump(out, open(cache, "w"))
-            print(f"  embedded {len(out)}/{len(texts)}", flush=True)
+        dt = _t.time() - tb
+        if dt > 20:
+            print(f"  slow batch at {i}: {dt:.0f}s", flush=True)
+        if cache and ((i // batch) % 10 == 0 or i + batch >= len(texts)):
+            json.dump({"ids": ids[:len(out)], "vecs": out}, open(cache, "w"))
+            rate = (len(out)) / max(_t.time() - t0, 1) * 60
+            print(f"  embedded {len(out)}/{len(texts)} ({rate:.0f}/min)", flush=True)
     if cache and os.path.exists(cache):
         os.remove(cache)
     return np.array(out, dtype=np.float32)
@@ -126,7 +144,9 @@ def main():
         if final.count("/") == 2:
             final += "/"
         canon = (r.get("canonical") or final).split("#")[0]
-        r["indexable"] = "noindex" not in (r.get("robots") or "") and canon.rstrip("/") == final.rstrip("/")
+        robots = (r.get("robots") or "") + " " + (r.get("x_robots") or "")
+        r["indexable"] = "noindex" not in robots and "none" not in robots.split() and canon.rstrip("/") == final.rstrip("/")
+        r["nofollow_page"] = "nofollow" in robots or "none" in robots.split()
         r["final"] = final
         recs.append(r)
     seen, pages = set(), []
@@ -180,10 +200,17 @@ def main():
     else:
         print(f"embedding {len(pages)} pages as {len(docs)} chunks with {a.model}")
         partial = os.path.join(a.out, "vectors.partial.json")
-        if os.path.exists(partial) and not (os.path.exists(meta_path) and json.load(open(meta_path)) == meta):
-            os.remove(partial)
+        if os.path.exists(meta_path):
+            om = json.load(open(meta_path))
+            if (om.get("model"), om.get("chunks")) != (a.model, a.chunks) and os.path.exists(partial):
+                os.remove(partial)  # different model or chunking: nothing reusable
         json.dump(meta, open(meta_path, "w"))
-        C = embed(docs, a.ollama, a.model, cache=partial)
+        cid = Counter()
+        ids = []
+        for o_ in owner:
+            ids.append(f"{pages[o_]['final']}#{cid[o_]}")
+            cid[o_] += 1
+        C = embed(docs, a.ollama, a.model, cache=partial, ids=ids)
         C = C / np.linalg.norm(C, axis=1, keepdims=True)
         V = np.zeros((len(pages), C.shape[1]), dtype=np.float32)
         np.add.at(V, np.array(owner), C)
@@ -234,7 +261,7 @@ def main():
                          "examples": [ms[i].get("title", "")[:90] for i in near]})
     clusters.sort(key=lambda x: -x["similarity_to_site"])
 
-    rows = [{"url": r["final"], "section": s, "indexable": bool(ok), "title": r.get("title", "")[:140],
+    rows = [{"url": r["final"], "section": s, "indexable": bool(ok), "nofollow_page": bool(r.get("nofollow_page")), "title": r.get("title", "")[:140],
              "h1": r.get("h1", "")[:140], "main_words": w, "distance": round(float(d), 4), "cluster": int(l)}
             for r, s, ok, w, d, l in zip(pages, secs, idx, main_words, dist, lab_all)]
     json.dump(rows, open(os.path.join(a.out, "pages.json"), "w"))

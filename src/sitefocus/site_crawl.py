@@ -34,6 +34,7 @@ from urllib.parse import urljoin, urldefrag, urlsplit
 # Identify yourself: SITEFOCUS_CONTACT=you@example.com
 _CONTACT = os.environ.get("SITEFOCUS_CONTACT") or os.environ.get("CCRA_CONTACT")
 UA = "Mozilla/5.0 (compatible; sitefocus/1.0" + (f"; +mailto:{_CONTACT}" if _CONTACT else "") + ")"
+BACKOFF = float(os.environ.get("SITEFOCUS_BACKOFF", "30"))  # seconds; first wait after a 429 or 503
 SKIP_EXT = re.compile(r"\.(pdf|jpe?g|png|gif|svg|webp|zip|mp4|mp3|css|js|xml|ico|woff2?|ttf|xlsx?|docx?)$", re.I)
 ZONE_TAGS = {"nav": "nav", "header": "header", "footer": "footer"}
 ZONE_HINT = re.compile(r"(^|[-_ ])(nav|navbar|menu|megamenu|header|footer|breadcrumb)", re.I)
@@ -152,7 +153,7 @@ def main():
     # Python's default UA, which CDNs often answer with 403, and it then
     # treats the whole site as disallowed.
     rp = urllib.robotparser.RobotFileParser()
-    robots_url = f"{urlsplit(a.start).scheme}://{host}/robots.txt"
+    robots_url = f"{urlsplit(a.start).scheme}://{urlsplit(a.start).netloc}/robots.txt"  # netloc keeps the port
     try:
         req = urllib.request.Request(robots_url, headers={"User-Agent": UA})
         with urllib.request.urlopen(req, timeout=30) as r:
@@ -224,6 +225,7 @@ def main():
                     req = urllib.request.Request(u, headers={"User-Agent": UA, "Accept": "text/html", "Accept-Encoding": "gzip"})
                     with urllib.request.urlopen(req, timeout=40) as r:
                         rec["status"] = r.status
+                        rec["x_robots"] = (r.headers.get("X-Robots-Tag") or "").lower()
                         rec["final"] = norm(r.geturl(), True) or r.geturl()
                         ctype = r.headers.get("Content-Type", "")
                         body = r.read()
@@ -242,8 +244,9 @@ def main():
                     break
                 except urllib.error.HTTPError as ex:
                     rec["status"] = ex.code
+                    ex.close()
                     if ex.code in (429, 503) and attempt < 2:
-                        time.sleep(30 * (attempt + 1))  # rate limited: back off, then retry
+                        time.sleep(BACKOFF * (attempt + 1))  # rate limited: back off, then retry
                         continue
                     break
                 except Exception as ex:

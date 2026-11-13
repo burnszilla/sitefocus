@@ -83,6 +83,8 @@ def run(argv):
     ap.add_argument("--gsc", help="Search Console Pages export (CSV): protects pages that earn clicks, targets near wins")
     ap.add_argument("--backlinks", help="backlink export (Search Console Top linked pages, Ahrefs or Semrush CSV)")
     ap.add_argument("--chunks", type=int, default=3, help="embedding windows per long page")
+    ap.add_argument("--no-recheck", action="store_true", help="skip the live re-check of flagged link targets")
+    ap.add_argument("--anchor-model", help="optional local Ollama model for anchor suggestions, e.g. qwen3:8b")
     a = ap.parse_args(argv)
     w = lambda *p: os.path.join(a.out, *p)
     os.makedirs(a.out, exist_ok=True)
@@ -96,6 +98,10 @@ def run(argv):
         plan += ["--gsc", a.gsc]
     if a.backlinks:
         plan += ["--backlinks", a.backlinks]
+    if a.no_recheck:
+        plan += ["--no-recheck"]
+    if a.anchor_model:
+        plan += ["--anchor-model", a.anchor_model]
     _run("link_plan", plan)
     host = a.start.split("://", 1)[-1].split("/")[0]
     rep = ["--focus", w("embed"), "--plan", w("plan"), "--site", host, "--out", w("report", "index.html")]

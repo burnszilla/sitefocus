@@ -4,11 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sitefocus"
-version = "1.1.0"
+version = "1.2.0"
 description = "Site focus and internal linking: Link Focus Score, page map, and a simulated internal linking plan."
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = ["numpy>=1.22"]
+
+authors = [{name = "Stephen Burns"}]
+
+[project.urls]
+Homepage = "https://github.com/burnszilla/sitefocus"
+Author = "https://stephenburns.ai"
 
 [project.scripts]
 sitefocus = "sitefocus.cli:main"

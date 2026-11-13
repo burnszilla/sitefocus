@@ -1,6 +1,6 @@
 ---
 name: site-focus
-description: Site focus and internal linking with the sitefocus tool. Scores every page on topic (closeness to the priority pages, from local embeddings) and on internal PageRank, computes the Link Focus Score, maps pages into stars, underlinked, leaks and long tail, finds orphaned priority pages and wasted sitewide links, and builds a simulated internal linking plan with an HTML report. Proxies for siteFocusScore and siteRadius from the 2024 Google Content Warehouse API leak. Use for "site focus", "siteFocusScore", "siteRadius", "topical focus", "internal linking plan", "internal PageRank", "orphan pages", "link equity", "which pages should link where".
+description: Site focus and internal linking with the sitefocus tool. Scores every page on topic (closeness to the priority pages, from local embeddings), internal PageRank and reach (internal harmonic centrality), computes the Link Focus Score, maps pages into stars, underlinked, leaks and long tail, finds orphaned priority pages and wasted sitewide links, and builds a simulated internal linking plan with an HTML report. Proxies for siteFocusScore and siteRadius from the 2024 Google Content Warehouse API leak. Use for "site focus", "siteFocusScore", "siteRadius", "topical focus", "internal linking plan", "internal PageRank", "orphan pages", "link equity", "which pages should link where".
 ---
 
 # site-focus

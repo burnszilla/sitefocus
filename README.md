@@ -1,5 +1,7 @@
 # sitefocus
 
+By [Stephen Burns](https://stephenburns.ai), technical SEO and AI visibility consultant.
+
 Site focus and internal linking in one tool. It answers one question: **is your site's link importance going to the pages that matter, and what links would fix it?**
 
 It crawls a site, reads every page with a local AI embedding model, scores each page on topic and on internal PageRank, and builds a linking plan that it simulates before you ship anything. Everything runs on your machine; page text only goes to a local Ollama model.
@@ -12,6 +14,8 @@ Every page gets two scores from 0 to 100. **Topic**: how close the page is to yo
 | --- | --- | --- |
 | **on topic** | Underlinked: send links here | Star: keep |
 | **off topic** | Long tail: leave, consolidate or noindex | Leak: review sitewide links pointing here |
+
+A third score, **reach**, is internal harmonic centrality: the average of 1 ÷ clicks from every other page (1.0 = one click from everywhere, 0 = unreachable). PageRank says how much link weight flows into a page; reach says how easily the rest of the site gets there. Pages whose PageRank runs far ahead of their reach are fed by a few strong links instead of being woven into the site.
 
 The plan fixes orphaned priority pages first, then sends links to near wins (with Search Console data) and to underlinked pages, and reruns PageRank to show the change. It also simulates bigger, template-level changes, because sitewide navigation and footer links usually carry most of a site's internal PageRank.
 
@@ -26,7 +30,7 @@ pip install "git+https://github.com/burnszilla/sitefocus"
 Or from a release wheel (no network to GitHub needed): download it from the Releases page, then
 
 ```
-pip install sitefocus-1.1.0-py3-none-any.whl
+pip install sitefocus-1.2.0-py3-none-any.whl
 ```
 
 Ollama and one embedding model (about 270 MB):
@@ -57,7 +61,7 @@ sitefocus run https://www.example.com/ \
 open work/example/report/index.html
 ```
 
-The crawl obeys robots.txt and runs at about 1.5 pages a second (2 workers, half a second apart). It is resumable: run the same command again to continue. A 5,000-page site takes about an hour to crawl and 10 to 20 minutes to embed.
+The crawl obeys robots.txt and runs at about 1.5 pages a second (2 workers, half a second apart), backing off and retrying when a server rate-limits it. Crawl and embedding are both resumable: run the same command again to continue, and finished work is reused. A 5,000-page site takes about an hour to crawl and 10 to 20 minutes to embed.
 
 ## Better inputs, better decisions
 
@@ -76,15 +80,20 @@ sitefocus run https://www.example.com/ --sitemap https://www.example.com/sitemap
 `work/example/report/`:
 
 - `index.html`:
+  - an **estimated impact** box (every change at once: Link Focus Score, priority pages' PageRank share, orphans, reach, Stars; with `--gsc`, a what-if range of extra clicks if strengthened pages gain 1 to 3 positions, from the site's own click-through curve)
+  - **how to execute, in order**: a numbered guide with scope, the list to work from, what to check before shipping, and how to measure
   - Link Focus Score now and after the plan, and **what moves the needle**: contextual links, the flagged sitewide swap, a related-products module, and reassigning sitewide content slots, each simulated
   - the page map (topic against link score) with a **before and after overlay**, PageRank by group, section and orphaned page
   - Search Console near wins and protected pages (with `--gsc`)
   - **link hygiene**: internal links to redirects, broken pages and noindexed pages, existing internal nofollow, sign-in and account links
   - **where nofollow belongs** (and why it cannot steer PageRank)
+  - **reach** (internal harmonic centrality) for priority pages, and pages whose PageRank runs ahead of their reach
   - **click depth**, **anchor text** on priority pages, **possible cannibalization** (near-identical editorial pages)
   - links to add, sitewide links, results by section, topic clusters, method and limits
-- `pages.csv`: every page with its topic score, link score and group
-- `link_adds.csv`: every recommended link with similarity, reason and a suggested anchor
+- `execution/`: one CSV per step of the guide at the top of the report ("How to execute, in order": baseline, link hygiene, orphaned priority pages, flagged sitewide slots, contextual links, near wins, underlinked pages, optional module test, sitewide content slots, near-duplicates, recrawl)
+- `pages.csv`: every page with its topic score, link score, reach and group
+- `link_adds.csv`: every recommended link with similarity, reason, the anchor, whether that anchor is already in the text, the paragraph to put it in, and a one-line instruction ("In the paragraph starting '…', link the words '…' to …"). `--anchor-model qwen3:8b` lets a local model suggest anchors where no phrase fits.
+- `hygiene.csv` (in the plan folder): every link-hygiene issue, rechecked live before it is reported
 - `sitewide.csv`: every page linked from at least half the site, with flags
 
 Add your own findings to the top of the report:
@@ -117,12 +126,21 @@ sitefocus plan   --crawl work/crawl --focus work/embed --priority priority.txt -
 sitefocus report --focus work/embed --plan work/plan --site example.com --out work/report/index.html
 ```
 
+## Tests
+
+```
+python -m unittest discover -s tests -v
+```
+
+34 tests, offline: PageRank against an independent dense implementation, exact harmonic centrality against brute force, Search Console and backlink export parsing, link placement rules, and an end-to-end run against a local fixture site (robots.txt, sitemap-only orphan, redirects, 404, a page that rate-limits once, meta noindex, X-Robots-Tag, page-level nofollow, a JavaScript-only link) with a fake embedding server. GitHub Actions runs them on Python 3.9 and 3.13.
+
 ## Settings
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | SITEFOCUS_CONTACT | none | your email, sent in the crawler's User-Agent |
 | SITEFOCUS_OLLAMA | http://localhost:11434 | Ollama server for embeddings |
+| SITEFOCUS_BACKOFF | 30 | seconds to wait after a 429 or 503 before retrying (doubles on the second retry) |
 
 ## Claude Code
 

@@ -48,7 +48,7 @@ import json
 import os
 import re
 from collections import Counter, defaultdict
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 import numpy as np
 
@@ -68,6 +68,44 @@ def pagerank(n, src, dst, d=0.85, iters=100, w=None, tele=None):
             return new
         pr = new
     return pr
+
+
+def _popcount(a, fallback=False):
+    """Bits set per uint64 element (numpy >= 2 has bitwise_count)."""
+    if hasattr(np, "bitwise_count") and not fallback:
+        return np.bitwise_count(a).astype(np.int64)
+    return np.unpackbits(a.view(np.uint8).reshape(-1, 8), axis=1).sum(1)
+
+
+def harmonic(n, src, dst):
+    """Exact internal harmonic centrality: HC(v) = sum over u != v of 1 / d(u, v),
+    d = shortest link path from u to v, normalised by n - 1. Breadth-first
+    search from 64 sources at once, one bit per source, so a 5,000-page site
+    takes seconds instead of hours."""
+    src = np.asarray(src, dtype=np.int64)
+    dst = np.asarray(dst, dtype=np.int64)
+    hc = np.zeros(n)
+    one = np.uint64(1)
+    for b0 in range(0, n, 64):
+        seeds = np.arange(b0, min(b0 + 64, n))
+        visited = np.zeros(n, dtype=np.uint64)
+        visited[seeds] = one << np.arange(len(seeds), dtype=np.uint64)
+        frontier = visited.copy()
+        k = 0
+        while True:
+            k += 1
+            nxt = np.zeros(n, dtype=np.uint64)
+            active = frontier[src] != 0
+            if not active.any():
+                break
+            np.bitwise_or.at(nxt, dst[active], frontier[src][active])
+            new = nxt & ~visited
+            if not new.any():
+                break
+            hc += _popcount(new) / k
+            visited |= new
+            frontier = new
+    return hc / max(n - 1, 1)
 
 
 def pctile(x):
@@ -153,6 +191,138 @@ def load_backlinks(path, redirect):
     return out
 
 
+import time as _time
+import urllib.error
+import urllib.request
+
+_UA = "Mozilla/5.0 (compatible; sitefocus/1.0" + (f"; +mailto:{os.environ['SITEFOCUS_CONTACT']}" if os.environ.get("SITEFOCUS_CONTACT") else "") + ")"
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def recheck(urls, delay=0.5, limit=200):
+    """Fetch each URL once more, without following redirects. Returns
+    {url: (status, location)}; status 0 means the request failed."""
+    opener = urllib.request.build_opener(_NoRedirect)
+    out = {}
+    for u in list(urls)[:limit]:
+        try:
+            r = opener.open(urllib.request.Request(u, headers={"User-Agent": _UA}), timeout=20)
+            out[u] = (r.status, "")
+            r.close()
+        except urllib.error.HTTPError as ex:
+            out[u] = (ex.code, ex.headers.get("Location", "") if ex.headers else "")
+            ex.close()
+        except Exception:
+            out[u] = (0, "")
+        _time.sleep(delay)
+    return out
+
+
+STOP = set("the and for with that this from your you are was were have has had not but can will what when how why who which into about over more than they them their there then also its our out all any may per via".split())
+WORD = re.compile(r"[a-z0-9][a-z0-9'’-]*")
+
+
+def _tokens(text):
+    return [w for w in WORD.findall(text.lower()) if len(w) > 2 and w not in STOP]
+
+
+def clean_title(t):
+    """'Married Filing Jointly vs Separately: How Should You File? - Brand Tax Tips' -> the useful part."""
+    t = (t or "").replace("®", "").replace("™", "").strip()
+    for sep in (" | ", " - ", " – ", " · "):
+        if sep in t:
+            head, tail = t.split(sep, 1)
+            # Drop a trailing brand or section suffix; keep the page's own name.
+            if len(head.strip()) >= 4 and len(tail.strip()) <= 45:
+                t = head.strip()
+    if len(t) > 60 and ":" in t:
+        t = t.split(":")[0].strip()
+    return t[:80]
+
+
+def _is_prose(b):
+    return 40 <= len(b) <= 1500 and len(b.split()) >= 8 and " | " not in b and (re.search(r"[.?!]", b) or len(b.split()) >= 15)
+
+
+def place_link(blocks, target_terms, idf, distinctive):
+    """Pick the source paragraph that best matches the target and a phrase in
+    it to use as anchor. The anchor must contain at least one distinctive word
+    (rare on the site), so generic phrases like "your taxes" never qualify.
+    Returns (paragraph, anchor or '', score)."""
+    best, bscore = "", 0.0
+    for b in blocks:
+        if not _is_prose(b):
+            continue
+        toks = set(_tokens(b))
+        shared = toks & target_terms
+        if not shared & distinctive:
+            continue  # only generic overlap: not a natural place for this link
+        sc = sum(idf.get(t, 0.0) for t in shared)
+        if sc > bscore:
+            best, bscore = b, sc
+    if not best:
+        return "", "", 0.0
+    words = re.findall(r"\S+", best)
+    norm = [re.sub(r"[^a-z0-9'’-]", "", w.lower()) for w in words]
+    pick, pscore = "", 0.0
+    for i in range(len(words)):
+        for j in range(i + 2, min(i + 7, len(words) + 1)):
+            seg = norm[i:j]
+            content = [w for w in seg if len(w) > 2 and w not in STOP]
+            if not content or seg[0] in STOP or seg[-1] in STOP or any(not w for w in seg):
+                continue
+            short = lambda k: len(norm[k]) < 3 and not re.fullmatch(r"[A-Z0-9][A-Z0-9-]*", words[k].strip(".,;:!?()\"'"))
+            if short(i) or short(j - 1):
+                continue  # no "to our system"; "S corporation" and "W-2 form" are fine
+            if any(re.search(r"[.?!:;,)]$", x) for x in words[i:j - 1]) or "(" in words[j - 1]:
+                continue  # do not span a sentence or clause break
+            if not all(w in target_terms for w in content) or not any(w in distinctive for w in content):
+                continue
+            sc = sum(idf.get(w, 0.0) for w in content)
+            if (len(content) >= 2 or sum(w in distinctive for w in content) >= 1 and len(seg) >= 2) and sc > pscore:
+                pick, pscore = " ".join(words[i:j]).strip(".,;:!?()\"'“”"), sc
+    return best, pick, bscore
+
+
+def llm_anchor(base, model, paragraph, target_title):
+    """Ask a local Ollama model for a short anchor phrase taken from the paragraph."""
+    prompt = ("Task: choose anchor text for an internal link.\n"
+              f"Target page title: {target_title}\n"
+              f"Paragraph: {paragraph[:1200]}\n\n"
+              "Rules: the anchor must be copied word for word from the Paragraph (2 to 6 consecutive words), must not be the "
+              "target title unless those exact words appear in the Paragraph, and must describe what the target page is about.\n"
+              "Example: title 'Roth IRA Calculator', paragraph 'You can open a Roth IRA at most banks.' -> a Roth IRA\n"
+              "Reply with only the copied words, or NONE if no words in the Paragraph fit.")
+    body = json.dumps({"model": model, "prompt": prompt, "stream": False, "think": False,
+                       "options": {"temperature": 0}}).encode()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(f"{base}/api/generate", data=body,
+                                    headers={"Content-Type": "application/json"}), timeout=60) as r:
+            ans = json.load(r).get("response", "").strip().strip('"').strip()
+    except Exception:
+        return ""
+    ans = re.sub(r"<think>.*?</think>", "", ans, flags=re.S).strip().strip(".")
+    if not ans or ans.upper() == "NONE":
+        return ""
+    if ans.lower() in paragraph.lower() and 2 <= len(ans.split()) <= 6:
+        return ans
+    # Small models often paraphrase. Keep the longest run of their words that
+    # really is in the paragraph, if it is at least two words long.
+    w_ = ans.split()
+    low = paragraph.lower()
+    for size in range(min(6, len(w_)), 1, -1):
+        for i in range(len(w_) - size + 1):
+            cand = " ".join(w_[i:i + size])
+            k = low.find(cand.lower())
+            if k >= 0:
+                return paragraph[k:k + len(cand)]
+    return ""
+
+
 GENERIC_ANCHOR = re.compile(r"^(learn more|read more|more|click here|here|see more|details|get started|start for free|start free|this|link|view|see details|find out more|continue|go)$", re.I)
 
 
@@ -174,6 +344,9 @@ def main():
     ap.add_argument("--module-section", help="section for the related-products module scenario (default: largest editorial section)")
     ap.add_argument("--backlinks", help="backlink export (Search Console Top linked pages, or Ahrefs/Semrush): external equity enters the model where it really lands")
     ap.add_argument("--template-weight", type=float, default=0.5, help="weight of navigation, footer and sitewide links relative to links in body copy (1 = all equal)")
+    ap.add_argument("--no-recheck", action="store_true", help="skip the live re-check of redirect, broken and rate-limited link targets")
+    ap.add_argument("--anchor-model", help="optional local Ollama model (e.g. qwen3:8b) to suggest anchors where no phrase in the paragraph matches")
+    ap.add_argument("--ollama", default=os.environ.get("SITEFOCUS_OLLAMA") or os.environ.get("CCRA_OLLAMA") or "http://localhost:11434")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
 
@@ -214,7 +387,7 @@ def main():
     pairs, body_pairs, leaked = set(), set(), 0
     anchors = defaultdict(Counter)
     hyg = {"to_redirect": Counter(), "to_broken": Counter(), "to_nonindexable": Counter(), "to_uncrawled": Counter(),
-           "rate_limited": Counter(), "nofollow": Counter(), "account": Counter()}
+           "rate_limited": Counter(), "nofollow": Counter(), "account": Counter(), "page_nofollow": Counter()}
     hyg_src = defaultdict(Counter)
     acct = re.compile(r"(sign-?in|log-?in|sign-?up|/register|create-?account|/account(/|$)|/my-?account|/cart(/|$)|/checkout|^my[a-z]*\.)", re.I)
     for r in csv.DictReader(open(os.path.join(a.crawl, "edges.csv"))):
@@ -222,6 +395,9 @@ def main():
         raw_t = r["target"]
         t = redirect.get(raw_t, raw_t)
         if s not in ix:
+            continue
+        if info.get(s, {}).get("nofollow_page"):
+            hyg["page_nofollow"][s] += 1
             continue
         if r.get("nofollow") == "1":
             hyg["nofollow"][raw_t] += 1
@@ -249,6 +425,25 @@ def main():
                     anchors[ix[t]][" ".join(r["anchor"].split()).lower()[:80]] += 1
         else:
             leaked += 1
+
+    live = {}
+    if not a.no_recheck:
+        todo = set(hyg["to_redirect"]) | set(hyg["to_broken"]) | set(hyg["rate_limited"])
+        if todo:
+            print(f"rechecking {len(todo)} link targets live", flush=True)
+            live = recheck(sorted(todo, key=lambda u: -(hyg["to_redirect"][u] + hyg["to_broken"][u] + hyg["rate_limited"][u])))
+        for u, (st_, loc) in live.items():
+            c = hyg["to_redirect"].pop(u, 0) + hyg["to_broken"].pop(u, 0) + hyg["rate_limited"].pop(u, 0)
+            if 300 <= st_ < 400:
+                hyg["to_redirect"][u] = c
+                if loc:
+                    finals[u] = urljoin(u, loc)
+            elif st_ in (429, 503) or st_ == 0:
+                hyg["rate_limited"][u] = c
+            elif st_ >= 400:
+                hyg["to_broken"][u] = c
+            # 2xx: fine on recheck, dropped
+            status[u] = st_ or status.get(u)
 
     indeg_all = Counter(t for _, t in pairs)
     sitewide_set = {t for t, k in indeg_all.items() if k >= a.template_share * n}
@@ -422,6 +617,10 @@ def main():
 
     e_adds = pairs | {(s_, t_) for s_, t_, _, _ in adds}
     pr_a = pr_of(e_adds)
+    hc0 = harmonic(n, [p_[0] for p_ in pairs], [p_[1] for p_ in pairs])
+    hca = harmonic(n, [p_[0] for p_ in e_adds], [p_[1] for p_ in e_adds])
+    reach0 = pctile(hc0)
+    reach_gap = reach0 - links0  # negative: PageRank runs ahead of reach (fed by a few strong links)
     e_swap = with_swap(e_adds)
     pr_b = pr_of(e_swap, template_pairs | moved_tpl)
     q_a, q_b = quadrants(pr_a), quadrants(pr_b)
@@ -439,8 +638,8 @@ def main():
 
     weakest = sorted(priority, key=lambda i: pr_a[i])
     depth = lambda t: len([x for x in urlsplit(nodes[t]).path.split("/") if x])
-    content_slots = [t for t in sitewide if t not in pset and depth(t) >= 2 and not protected[t]][: a.slots]
-    slot_in = [p_ for p_ in weakest if p_ not in sitewide_set][: len(content_slots)]  # moving a slot to a page already linked sitewide changes nothing
+    content_slots = [t for t in sitewide if t not in pset and t not in swap_out and depth(t) >= 2 and not protected[t]][: a.slots]
+    slot_in = [p_ for p_ in weakest if p_ not in sitewide_set and p_ not in swap_in][: len(content_slots)]  # moving a slot to a page already linked sitewide changes nothing
     content_slots = content_slots[: len(slot_in)]
     e_slots = reassign(e_adds, content_slots, slot_in)
     msec = a.module_section or next((x["group"] for x in F["sections"] if x["group"] not in big_secs and x["pages"] >= 50), None)
@@ -464,9 +663,69 @@ def main():
                      else "not applicable: every priority page is already linked sitewide, or no unprotected content slot exists"),
          "caveat": ("pages with the most clicks are excluded" if has_gsc else "check traffic first: these slots may hold pages that earn clicks (add --gsc)")},
     ]
+    def traffic_scenario():
+        """Clicks if the pages the plan strengthens gain 1, 2 or 3 positions,
+        using this site's own CTR-by-position curve from the GSC export. A
+        what-if range, not a forecast; None when the data cannot support it."""
+        if not has_gsc:
+            return {"available": False, "reason": "no Search Console export (--gsc)"}
+        ok = (impr >= 20) & (pos > 0)
+        buckets = {}
+        for b in range(1, 21):
+            m = ok & (np.round(pos) == b)
+            if m.sum() >= 3:
+                buckets[b] = float(clicks[m].sum() / impr[m].sum())
+        if len(buckets) < 6 or 1 not in buckets and 2 not in buckets:
+            return {"available": False, "reason": f"not enough Search Console data to build this site's CTR curve ({len(buckets)} usable positions; need 6 including position 1 or 2)"}
+        xs = sorted(buckets)
+        ys = [buckets[x] for x in xs]
+        for i in range(1, len(ys)):  # CTR should not rise as position worsens
+            ys[i] = min(ys[i], ys[i - 1])
+
+        def ctr(p_):
+            p_ = min(max(p_, xs[0]), xs[-1])
+            return float(np.interp(p_, xs, ys))
+        strengthened = set(t for _, t, _, _ in adds) | set(slot_in) | set(swap_in) | set(priority)
+        cand = [i for i in strengthened if impr[i] > 0 and 1.5 < pos[i] <= 30]
+        out = {"available": True, "pages": len(cand), "impressions": float(impr[cand].sum()) if cand else 0.0,
+               "clicks_now": float(clicks[cand].sum()) if cand else 0.0, "curve": {str(x): round(y, 4) for x, y in zip(xs, ys)}}
+        for g in (1, 2, 3):
+            gain = 0.0
+            for i in cand:
+                gain += max(impr[i] * ctr(max(1.0, pos[i] - g)) - clicks[i], 0.0)
+            out[f"gain_{g}"] = round(gain)
+        return out
+
+    # Every recommended change at once: contextual links, the module, the
+    # flagged swap and the sitewide content slots.
+    moved_tpl.clear()
+    e_all = reassign(with_swap(e_mod), content_slots, slot_in)
+    pr_all = pr_of(e_all, template_pairs | moved_tpl)
+    hc_all = harmonic(n, [p_[0] for p_ in e_all], [p_[1] for p_ in e_all])
+    link_all = defaultdict(set)
+    for s_, t_ in e_all:
+        link_all[t_].add(s_)
+    q_all = quadrants(pr_all)
+    scen.append({"name": "Every change together", "lfs": lfs(pr_all), "priority": float(pr_all[pri_].sum()),
+                 "changes": "contextual links, module, flagged swap and sitewide content slots", "caveat": scen[-1]["caveat"]})
     for x in scen:
         x["lfs"] = round(x["lfs"], 1)
         x["priority"] = round(x["priority"], 4)
+    impact = {
+        "lfs": [round(lfs(pr), 1), round(lfs(pr_all), 1)],
+        "priority_share": [round(float(pr[pri_].sum()), 4), round(float(pr_all[pri_].sum()), 4)],
+        "orphans": [len(orphans), sum(1 for t in priority if len(link_all[t]) <= 2)],
+        "priority_reach_median": [round(float(np.median(hc0[pri_])), 3), round(float(np.median(hc_all[pri_])), 3)],
+        "priority_reach_min": [round(float(hc0[pri_].min()), 3), round(float(hc_all[pri_].min()), 3)],
+        "stars": [int(q0["star"].sum()), int(q_all["star"].sum())],
+        "underlinked": [int(q0["underlinked"].sum()), int(q_all["underlinked"].sum())],
+        "links_added": len(adds) + (len(e_mod) - len(e_adds)),
+        "slots_moved": len(swap_out) + len(content_slots),
+        "slots_need_traffic_check": (not has_gsc) and bool(content_slots),
+        "hygiene_links": int(sum(hyg[k] [u] for k in ("to_redirect", "to_broken", "to_nonindexable") for u in hyg[k])),
+        "near_wins_linked": int(sum(1 for i in np.where(near_win)[0] if new_in[i] > 0)) if has_gsc else None,
+        "traffic": traffic_scenario(),
+    }
     pri = np.array(priority)
 
     def share(p, m):
@@ -528,10 +787,23 @@ def main():
         "sitewide_targets": len(sitewide),
         "sitewide_leaks": [{"url": nodes[t], "topic": round(float(topic[t]), 1), "title": info[nodes[t]]["title"]} for t in sitewide if topic[t] < 25 and t not in pset],
         "near_duplicates": near_dups,
+        "reach": {
+            "spearman_links": round(float(np.corrcoef(pctile(pr), reach0)[0, 1]), 3),
+            "priority_reach_median": [round(float(np.median(hc0[pri])), 3), round(float(np.median(hca[pri])), 3)],
+            "site_reach_median": [round(float(np.median(hc0)), 3), round(float(np.median(hca)), 3)],
+            "priority": [{"url": nodes[i], "reach": round(float(reach0[i]), 1), "links": round(float(links0[i]), 1),
+                          "hc_now": round(float(hc0[i]), 4), "hc_after": round(float(hca[i]), 4)} for i in priority],
+            "links_ahead": [{"url": nodes[i], "title": info[nodes[i]]["title"], "reach": round(float(reach0[i]), 1), "links": round(float(links0[i]), 1),
+                             "linking_pages": len(linking[i])} for i in np.argsort(reach_gap)[:20] if reach_gap[i] <= -25],
+            "reach_ahead": [{"url": nodes[i], "title": info[nodes[i]]["title"], "reach": round(float(reach0[i]), 1), "links": round(float(links0[i]), 1),
+                             "linking_pages": len(linking[i])} for i in np.argsort(-reach_gap)[:20] if reach_gap[i] >= 25],
+        },
         "scenarios": scen,
+        "impact": impact,
         "model": {"template_weight": a.template_weight, "template_links": len(template_pairs), "backlinks": bool(backlinks),
                   "backlink_pages": int((ext > 0).sum()) if backlinks else 0},
         "hygiene": {k: {"links": int(sum(v.values())), "targets": len(v), "top": [[u, c] for u, c in v.most_common(15)]} for k, v in hyg.items()},
+        "rechecked": {"targets": len(live), "fine_now": sum(1 for st_, _ in live.values() if 200 <= st_ < 300)},
         "hygiene_sources": {k: [[u, c] for u, c in v.most_common(10)] for k, v in hyg_src.items()},
         "depth": {"distribution": dict(Counter("not reached" if d < 0 else (str(d) if d <= 5 else "6+") for d in depth_of)),
                   "priority_deep": [{"url": nodes[i], "depth": int(depth_of[i])} for i in priority if depth_of[i] < 0 or depth_of[i] > 3]},
@@ -557,20 +829,71 @@ def main():
     }
     with open(os.path.join(a.out, "pages.csv"), "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["url", "section", "topic", "links", "links_after", "group", "priority", "linking_pages", "depth", "pagerank", "pagerank_after",
+        w.writerow(["url", "section", "topic", "links", "links_after", "reach", "reach_gap", "group", "priority", "linking_pages", "depth", "pagerank", "pagerank_after",
                     "external_linking_sites", "clicks", "impressions", "position", "protected", "near_win", "title"])
         la = pctile(pr_a)
         for i in np.argsort(-topic):
             g = next(k for k in qnames if q0[k][i])
-            w.writerow([nodes[i], secs[i], round(float(topic[i]), 1), round(float(links0[i]), 1), round(float(la[i]), 1), g, int(i in pset), len(linking[i]),
+            w.writerow([nodes[i], secs[i], round(float(topic[i]), 1), round(float(links0[i]), 1), round(float(la[i]), 1),
+                        round(float(reach0[i]), 1), round(float(reach_gap[i]), 1), g, int(i in pset), len(linking[i]),
                         int(depth_of[i]) if depth_of[i] >= 0 else "", f"{pr[i]:.3e}", f"{pr_a[i]:.3e}", int(ext[i]) if backlinks else "", int(clicks[i]), int(impr[i]), round(float(pos[i]), 1) if pos[i] else "",
                         int(protected[i]), int(near_win[i]), info[nodes[i]]["title"]])
+    # Where each new link goes: the paragraph on the source page that best
+    # matches the target, and an anchor phrase already in that paragraph.
+    need = {nodes[s_] for s_, _, _, _ in adds}
+    texts, df = {}, Counter()
+    for line in open(os.path.join(a.crawl, "pages.jsonl")):
+        r = json.loads(line)
+        if not r.get("text"):
+            continue
+        f_ = redirect.get(r["url"], r["url"])
+        blocks_ = [b.strip() for b in r["text"].split("\n") if b.strip()]
+        df.update(set(blocks_))
+        if f_ in need:
+            texts[f_] = blocks_
+    npages = max(len(fp), 1)
+    cutoff = max(20, 0.15 * npages)
+    gdf, ndocs = Counter(), 0
+    for line in open(os.path.join(a.crawl, "pages.jsonl")):
+        r = json.loads(line)
+        if r.get("text"):
+            ndocs += 1
+            gdf.update(set(t for b in r["text"].split("\n") if b.strip() and df[b.strip()] <= cutoff for t in _tokens(b)))
+    import math as _math
+    idf = {t: _math.log(ndocs / (1 + c)) for t, c in gdf.items()}
+    distinctive = {t for t, c in gdf.items() if c / max(ndocs, 1) < 0.10}
+    llm_left = 150 if a.anchor_model else 0
+    instr = {}
+    for s_, t_, sm, why in adds:
+        tu = nodes[t_]
+        h1 = info[tu]["h1"] or ""
+        title = clean_title(h1 if 8 <= len(h1) <= 70 and "*" not in h1 else info[tu]["title"])
+        terms = set(_tokens(title + " " + (info[tu]["title"] or "")))
+        body = [b for b in texts.get(nodes[s_], []) if df[b] <= cutoff]
+        para, anchor, sc = place_link(body, terms, idf, distinctive)
+        in_text = bool(anchor)
+        if not anchor and para and llm_left and why.startswith(("orphan", "priority")):
+            llm_left -= 1
+            anchor = llm_anchor(a.ollama, a.anchor_model, para, title)
+            in_text = bool(anchor)
+        if not anchor:
+            anchor = title
+        if para and in_text:
+            how = f'In the paragraph starting "{para[:90]}", link the words "{anchor}" to {tu}'
+        elif para:
+            how = f'After the paragraph starting "{para[:90]}", add a sentence that links "{anchor}" to {tu}'
+        else:
+            how = f'Add a link with the text "{anchor}" to {tu} where the topic comes up'
+        instr[(s_, t_)] = (anchor, int(in_text), para[:300], how)
+
+    res["anchors_in_text"] = [sum(x[1] for x in instr.values()), len(instr)]
     with open(os.path.join(a.out, "link_adds.csv"), "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["source", "target", "similarity", "reason", "suggested_anchor"])
+        w.writerow(["source", "target", "similarity", "reason", "suggested_anchor", "anchor_in_text", "paragraph", "instruction"])
         order = {"orphan: parent hub": 0, "orphan: similar page": 1, "priority": 2, "near win": 3, "underlinked": 4}
         for s_, t_, sm, why in sorted(adds, key=lambda x: (order[x[3]], -x[2])):
-            w.writerow([nodes[s_], nodes[t_], round(sm, 3), why, info[nodes[t_]]["h1"] or info[nodes[t_]]["title"]])
+            an, it, pa, how = instr[(s_, t_)]
+            w.writerow([nodes[s_], nodes[t_], round(sm, 3), why, an, it, pa, how])
     with open(os.path.join(a.out, "sitewide.csv"), "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["target", "section", "linked_from_pages", "topic", "pagerank_share", "flag", "swap", "slot_scenario", "clicks", "protected", "title"])
@@ -578,6 +901,15 @@ def main():
             w.writerow([nodes[t], secs[t], indeg[t], round(float(topic[t]), 1), f"{pr[t]:.4f}",
                         flag(t) or ("leak" if topic[t] < 25 else ""), int(t in swap_out), int(t in content_slots),
                         int(clicks[t]) if has_gsc else "", int(protected[t]) if has_gsc else "", info[nodes[t]]["title"]])
+    with open(os.path.join(a.out, "hygiene.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["issue", "target", "links_to_it", "points_to", "status", "rechecked_live"])
+        names = {"to_redirect": "links to a redirect", "to_broken": "links to a broken page", "to_nonindexable": "links to a noindexed or canonicalised page",
+                 "rate_limited": "not checked (rate limited)", "to_uncrawled": "links to a blocked or unfetched page", "nofollow": "internal nofollow",
+                 "account": "sign-in, sign-up, account or cart link", "page_nofollow": "page with meta robots nofollow (its links pass nothing)"}
+        for k, v in hyg.items():
+            for u, c in v.most_common():
+                w.writerow([names[k], u, c, finals.get(u, "") if k == "to_redirect" else "", status.get(u, ""), int(u in live)])
     json.dump(res, open(os.path.join(a.out, "plan.json"), "w"), indent=1)
     print(json.dumps({k: res[k] for k in ("pages", "link_focus_score", "adds")}, indent=1))
     for x in scen:
