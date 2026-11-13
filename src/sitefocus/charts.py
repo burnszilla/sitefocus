@@ -88,7 +88,7 @@ def page_map(rows, top_sections):
     legend.insert(-1, '<span class="ov-only"><i class="key ghost-key"></i>before</span>'
                       f'<span class="ov-only"><i class="key up-key"></i>moved up ({up:,})</span>'
                       f'<span class="ov-only"><i class="key down-key"></i>moved down ({down:,})</span>')
-    safe = json.dumps(data).replace("</", "<\\/")
+    safe = json.dumps(data).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
     payload = '<script type="application/json" id="pm-data">' + safe + '</script>'
     return f'<figure class="chart">{controls}{"".join(legend)}<div class="viz-wrap">{"".join(out)}</div>{payload}' \
            '<figcaption>Hover a dot for the page. Larger dark dots are priority pages. "After the links" moves every page to its link score after the plan; "Before and after" overlays both, with a line for every page that moves by 2 points or more. A flat row of dots is a set of pages with identical internal PageRank, usually templated pages that are only linked from their directory.</figcaption></figure>'
@@ -101,13 +101,17 @@ def dumbbell(items, title, log=False, value_label="share of internal PageRank"):
     pw = W - m["l"] - m["r"]
     h = m["t"] + m["b"] + row * len(items)
     vals = [v for it in items for v in it[1:] if v is not None and v > 0]
+    if not vals:
+        return ""
     if log:
         lo = 10 ** math.floor(math.log10(min(vals) * 100))
         hi = 10 ** math.ceil(math.log10(max(vals) * 100))
+        if hi <= lo:  # all values on one power of ten
+            hi = lo * 10
         X = lambda v: m["l"] + (math.log10(max(v * 100, lo)) - math.log10(lo)) / (math.log10(hi) - math.log10(lo)) * pw
         ticks = [lo * 10 ** k for k in range(int(round(math.log10(hi / lo))) + 1)]
     else:
-        hi = max(vals) * 100
+        hi = max(max(vals) * 100, 1e-9)
         step = 5 if hi <= 40 else 10 if hi <= 80 else 20
         hi = math.ceil(hi / step) * step
         X = lambda v: m["l"] + v * 100 / hi * pw

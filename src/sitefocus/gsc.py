@@ -36,6 +36,11 @@ import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+try:
+    from .common import write_private
+except ImportError:
+    from common import write_private
+
 SCOPE = "https://www.googleapis.com/auth/webmasters.readonly"
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = os.environ.get("SITEFOCUS_GOOGLE_TOKEN_URL", "https://oauth2.googleapis.com/token")
@@ -100,12 +105,13 @@ def access_token(creds=None):
     except urllib.error.HTTPError as ex:
         ex.close()
         raise SystemExit(f"Could not refresh the {src} Search Console credentials ({ex.code}). Run sitefocus gsc-login again.")
-    if SCOPE not in tok.get("scope", SCOPE) and "webmasters" not in tok.get("scope", "webmasters"):
+    granted = tok.get("scope", "").split()
+    if granted and not ({SCOPE, "https://www.googleapis.com/auth/webmasters"} & set(granted)):
         raise SystemExit(f"The {src} credentials do not include Search Console access. " + HOW_TO_CONNECT)
     return tok["access_token"]
 
 
-def login(client_secret_path, open_browser=True):
+def login(client_secret_path, open_browser=True, timeout=300):
     d = json.load(open(client_secret_path))
     d = d.get("installed") or d.get("web") or d
     cid, csec = d["client_id"], d["client_secret"]
@@ -119,16 +125,19 @@ def login(client_secret_path, open_browser=True):
             pass
 
         def do_GET(self):
-            q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
-            got.update({k: v[0] for k, v in q.items()})
-            ok = "code" in got and got.get("state") == state
-            self.send_response(200)
+            q = {k: v[0] for k, v in urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).items()}
+            ours = q.get("state") == state
+            if ours and ("code" in q or "error" in q) and not got:
+                got.update(q)  # only the first callback carrying our state counts
+            ok = ours and "code" in q
+            self.send_response(200 if ours else 404)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             self.wfile.write(("<p>sitefocus is connected to Search Console. You can close this tab.</p>" if ok
-                              else "<p>Connection failed. Return to the terminal.</p>").encode())
+                              else "<p>Connection failed. Return to the terminal.</p>" if ours else "").encode())
 
     srv = HTTPServer(("127.0.0.1", 0), H)
+    srv.timeout = 2
     redirect = f"http://127.0.0.1:{srv.server_port}/"
     url = AUTH_URL + "?" + urllib.parse.urlencode({
         "client_id": cid, "redirect_uri": redirect, "response_type": "code", "scope": SCOPE,
@@ -137,19 +146,19 @@ def login(client_secret_path, open_browser=True):
     print("Opening your browser to connect Search Console (read-only). If it does not open, visit:\n" + url, flush=True)
     if open_browser:
         webbrowser.open(url)
-    while "code" not in got and "error" not in got:
-        srv.handle_request()
+    deadline = __import__("time").time() + timeout
+    while not got and __import__("time").time() < deadline:
+        srv.handle_request()  # stray or forged callbacks without our state are ignored
     srv.server_close()
-    if got.get("state") != state or "code" not in got:
-        raise SystemExit(f"Search Console connection failed: {got.get('error', 'state mismatch')}")
+    if not got:
+        raise SystemExit(f"No response from the browser within {timeout // 60} minutes; run sitefocus gsc-login again.")
+    if "code" not in got:
+        raise SystemExit(f"Search Console connection was refused: {got.get('error', 'unknown error')}")
     tok = _post_form(TOKEN_URL, {"client_id": cid, "client_secret": csec, "code": got["code"], "code_verifier": verifier,
                                  "grant_type": "authorization_code", "redirect_uri": redirect})
     if not tok.get("refresh_token"):
         raise SystemExit("Google returned no refresh token; remove sitefocus from https://myaccount.google.com/permissions and try again.")
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    fd = os.open(STORE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump({"client_id": cid, "client_secret": csec, "refresh_token": tok["refresh_token"]}, f)
+    write_private(STORE, json.dumps({"client_id": cid, "client_secret": csec, "refresh_token": tok["refresh_token"]}))
     print(f"Connected. Credentials saved to {STORE} (readable only by you).")
 
 
@@ -159,14 +168,30 @@ def sites(token=None):
 
 
 def pick_site(url, available):
-    """Best property for a URL: the longest matching URL-prefix property,
-    else a domain property (sc-domain:) the host belongs to."""
+    """Best property for a URL: the URL-prefix property with the same scheme,
+    host and port and the longest path prefix (on a path boundary), else the
+    narrowest domain property (sc-domain:) the host belongs to."""
     p = urllib.parse.urlsplit(url)
     host = (p.hostname or "").lower()
-    prefix = [s for s in available if not s.startswith("sc-domain:") and url.lower().startswith(s.lower().rstrip("/"))]
-    if prefix:
-        return max(prefix, key=len)
-    dom = [s for s in available if s.startswith("sc-domain:") and (host == s[10:] or host.endswith("." + s[10:]))]
+    scheme = p.scheme.lower()
+    dport = {"http": 80, "https": 443}.get(scheme)
+    path = p.path or "/"
+    best = None
+    for s_ in available:
+        if s_.startswith("sc-domain:"):
+            continue
+        q = urllib.parse.urlsplit(s_)
+        if q.scheme.lower() != scheme or (q.hostname or "").lower() != host or (q.port or dport) != (p.port or dport):
+            continue
+        qp = q.path or "/"
+        if not qp.endswith("/"):
+            qp += "/"
+        if (path if path.endswith("/") else path + "/").startswith(qp):
+            if best is None or len(qp) > best[0]:
+                best = (len(qp), s_)
+    if best:
+        return best[1]
+    dom = [s_ for s_ in available if s_.startswith("sc-domain:") and (host == s_[10:].lower() or host.endswith("." + s_[10:].lower()))]
     return max(dom, key=len) if dom else None
 
 

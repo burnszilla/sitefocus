@@ -33,7 +33,14 @@ import urllib.request
 from collections import Counter, defaultdict
 from urllib.parse import urlsplit
 
+import hashlib
+
 import numpy as np
+
+try:
+    from .common import read_pages
+except ImportError:
+    from common import read_pages
 
 
 def section_of(url):
@@ -96,18 +103,24 @@ def embed(texts, base, model, batch=16, cache=None, ids=None):
 
 
 def kmeans(X, k, iters=40, seed=7):
+    """Cosine k-means++ on unit vectors. k is capped at the number of distinct
+    vectors; seeding stops early when every point already has a centre."""
     rng = np.random.default_rng(seed)
-    # k-means++ on cosine (X is unit-normalised)
+    k = max(1, min(k, len(np.unique(np.round(X, 6), axis=0))))
     C = [X[rng.integers(len(X))]]
     for _ in range(1, k):
         d = 1 - np.max(X @ np.array(C).T, axis=1)
         p = np.clip(d, 0, None) ** 2
+        if p.sum() <= 1e-12:
+            break
         C.append(X[rng.choice(len(X), p=p / p.sum())])
     C = np.array(C)
+    k = len(C)
     for _ in range(iters):
         lab = np.argmax(X @ C.T, axis=1)
         newC = np.array([X[lab == j].mean(0) if np.any(lab == j) else C[j] for j in range(k)])
-        newC /= np.linalg.norm(newC, axis=1, keepdims=True)
+        nn = np.linalg.norm(newC, axis=1, keepdims=True)
+        newC = newC / np.where(nn == 0, 1, nn)
         if np.allclose(newC, C, atol=1e-6):
             break
         C = newC
@@ -118,7 +131,7 @@ def focus_stats(V, w=None):
     w = np.ones(len(V)) if w is None else np.asarray(w, dtype=np.float64)
     m = (V * w[:, None]).sum(0) / w.sum()
     focus = float(np.linalg.norm(m))
-    c = m / np.linalg.norm(m)
+    c = m / focus if focus > 0 else m
     dist = 1 - V @ c
     return focus, c, dist
 
@@ -136,8 +149,7 @@ def main():
     os.makedirs(a.out, exist_ok=True)
 
     recs = []
-    for line in open(a.pages):
-        r = json.loads(line)
+    for r in read_pages(a.pages):
         if r.get("status") != 200 or "text" not in r:
             continue
         final = (r.get("final") or r["url"]).split("#")[0]
@@ -175,54 +187,53 @@ def main():
             docs.append(f"search_document: {head}{part}"[:6000])
             owner.append(pi)
 
-    vec_path = os.path.join(a.out, "vectors.npy")
-    key_path = os.path.join(a.out, "vectors.keys.json")
-    meta_path = os.path.join(a.out, "vectors.meta.json")
-    meta = {"model": a.model, "chunks": a.chunks, "docs": len(docs)}
-    cached = (os.path.exists(vec_path) and os.path.exists(key_path) and json.load(open(key_path)) == [r["final"] for r in pages]
-              and os.path.exists(meta_path) and json.load(open(meta_path)) == meta)
-    reuse = None
-    if not cached and os.path.exists(vec_path) and os.path.exists(key_path) and os.path.exists(meta_path):
-        old_meta = json.load(open(meta_path))
-        if old_meta.get("model") == a.model and old_meta.get("chunks") == a.chunks:
-            old = dict(zip(json.load(open(key_path)), np.load(vec_path)))
-            if all(r["final"] in old for r in pages):
-                reuse = np.array([old[r["final"]] for r in pages])
-    if cached:
-        V = np.load(vec_path)
-    elif reuse is not None:
-        print("reusing cached embeddings (every page already embedded)")
-        V = reuse
-        np.save(vec_path, V)
-        json.dump([r["final"] for r in pages], open(key_path, "w"))
-        meta["docs"] = len(docs)
-        json.dump(meta, open(meta_path, "w"))
+    # Embeddings are cached per chunk, keyed by a hash of the model and the
+    # exact text sent. Changed pages are re-embedded; unchanged ones are not.
+    hashes = [hashlib.sha1(f"{a.model}\x00{d}".encode("utf-8", "replace")).hexdigest() for d in docs]
+    ck_path, cv_path = os.path.join(a.out, "chunks.keys.json"), os.path.join(a.out, "chunks.npy")
+    cache = {}
+    if os.path.exists(ck_path) and os.path.exists(cv_path):
+        try:
+            cache = dict(zip(json.load(open(ck_path)), np.load(cv_path)))
+        except Exception:
+            cache = {}
+    missing = [i_ for i_, h in enumerate(hashes) if h not in cache]
+    if missing:
+        print(f"embedding {len(missing)} of {len(docs)} chunks ({len(pages)} pages) with {a.model}", flush=True)
+        new = embed([docs[i_] for i_ in missing], a.ollama, a.model,
+                    cache=os.path.join(a.out, "vectors.partial.json"), ids=[hashes[i_] for i_ in missing])
+        for i_, v in zip(missing, new):
+            cache[hashes[i_]] = v
     else:
-        print(f"embedding {len(pages)} pages as {len(docs)} chunks with {a.model}")
-        partial = os.path.join(a.out, "vectors.partial.json")
-        if os.path.exists(meta_path):
-            om = json.load(open(meta_path))
-            if (om.get("model"), om.get("chunks")) != (a.model, a.chunks) and os.path.exists(partial):
-                os.remove(partial)  # different model or chunking: nothing reusable
-        json.dump(meta, open(meta_path, "w"))
-        cid = Counter()
-        ids = []
-        for o_ in owner:
-            ids.append(f"{pages[o_]['final']}#{cid[o_]}")
-            cid[o_] += 1
-        C = embed(docs, a.ollama, a.model, cache=partial, ids=ids)
-        C = C / np.linalg.norm(C, axis=1, keepdims=True)
-        V = np.zeros((len(pages), C.shape[1]), dtype=np.float32)
-        np.add.at(V, np.array(owner), C)
-        np.save(vec_path, V)
-        json.dump([r["final"] for r in pages], open(key_path, "w"))
-    V = V / np.linalg.norm(V, axis=1, keepdims=True)
+        print(f"all {len(docs)} chunks already embedded; reusing", flush=True)
+    C = np.array([cache[h] for h in hashes], dtype=np.float32)
+    cn = np.linalg.norm(C, axis=1, keepdims=True)
+    C = C / np.where(cn == 0, 1, cn)
+    V = np.zeros((len(pages), C.shape[1]), dtype=np.float32)
+    np.add.at(V, np.array(owner), C)
+
+    def _atomic(path, writer):
+        tmp = path + ".tmp"
+        writer(tmp)
+        os.replace(tmp, path)
+    # Commit everything only after embedding succeeded.
+    _atomic(cv_path, lambda t: np.save(open(t, "wb"), C))
+    _atomic(ck_path, lambda t: json.dump(hashes, open(t, "w")))
+    _atomic(os.path.join(a.out, "vectors.npy"), lambda t: np.save(open(t, "wb"), V))
+    _atomic(os.path.join(a.out, "vectors.keys.json"), lambda t: json.dump([r["final"] for r in pages], open(t, "w")))
+    _atomic(os.path.join(a.out, "vectors.meta.json"), lambda t: json.dump(
+        {"model": a.model, "chunks": a.chunks, "boilerplate": a.boilerplate, "boilerplate_min_pages": 20, "docs": len(docs)}, open(t, "w")))
+    vn = np.linalg.norm(V, axis=1, keepdims=True)
+    V = V / np.where(vn == 0, 1, vn)
 
     idx = np.array([r["indexable"] for r in pages])
+    if not idx.any():
+        raise SystemExit("none of the crawled pages are indexable (all noindex, canonicalised elsewhere or non-200); nothing to analyse")
     Vi = V[idx]
     focus, c, dist_i = focus_stats(Vi)
     dist = 1 - V @ c
     lab, C = kmeans(Vi, a.k)
+    k_used = len(C)
     lab_all = np.argmax(V @ C.T, axis=1)
 
     secs = [section_of(r["final"]) for r in pages]
@@ -248,7 +259,7 @@ def main():
                        "focus_change": round(f2 - focus, 3), "radius_median": round(float(np.median(d2)), 3)})
 
     clusters = []
-    for j in range(a.k):
+    for j in range(k_used):
         m = lab == j
         if not m.any():
             continue
@@ -266,7 +277,8 @@ def main():
             for r, s, ok, w, d, l in zip(pages, secs, idx, main_words, dist, lab_all)]
     json.dump(rows, open(os.path.join(a.out, "pages.json"), "w"))
     res = {
-        "model": a.model, "pages_fetched_ok": len(pages), "pages_indexable": int(idx.sum()),
+        "model": a.model, "chunks": a.chunks, "boilerplate_share": a.boilerplate, "boilerplate_cut": int(cut), "clusters_used": k_used,
+        "pages_fetched_ok": len(pages), "pages_indexable": int(idx.sum()),
         "boilerplate_blocks_removed": sum(1 for b, n in freq.items() if n > cut),
         "site": {"focus": round(focus, 3), "radius_median": round(float(np.median(dist_i)), 3),
                  "radius_p90": round(float(np.percentile(dist_i, 90)), 3)},

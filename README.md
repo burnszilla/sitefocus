@@ -2,6 +2,8 @@
 
 By [Stephen Burns](https://stephenburns.ai), technical SEO and AI visibility consultant.
 
+**New here? Read the [user guide](docs/GUIDE.md):** install, a first run, choosing priority pages, connecting Search Console, reading every section of the report, shipping the changes and measuring them, the formulas, and troubleshooting.
+
 Site focus and internal linking in one tool. It answers one question: **is your site's link importance going to the pages that matter, and what links would fix it?**
 
 It crawls a site, reads every page with a local AI embedding model, scores each page on topic and on internal PageRank, and builds a linking plan that it simulates before you ship anything. Everything runs on your machine; page text only goes to a local Ollama model.
@@ -30,7 +32,7 @@ pip install "git+https://github.com/burnszilla/sitefocus"
 Or from a release wheel (no network to GitHub needed): download it from the Releases page, then
 
 ```
-pip install sitefocus-1.3.0-py3-none-any.whl
+pip install sitefocus-1.4.0-py3-none-any.whl
 ```
 
 Ollama and one embedding model (about 270 MB):
@@ -61,7 +63,7 @@ sitefocus run https://www.example.com/ \
 open work/example/report/index.html
 ```
 
-The crawl obeys robots.txt and runs at about 1.5 pages a second (2 workers, half a second apart), backing off and retrying when a server rate-limits it. Crawl and embedding are both resumable: run the same command again to continue, and finished work is reused. A 5,000-page site takes about an hour to crawl and 10 to 20 minutes to embed.
+The crawl obeys robots.txt (including Crawl-delay), spaces requests at least half a second apart across all workers, and backs off when a server rate-limits it. Crawl and embedding are both resumable: run the same command again to continue, and finished work is reused. After shipping changes, rerun with `--fresh` to recrawl; embeddings are cached by content, so only changed pages are re-embedded. A 5,000-page site takes about an hour to crawl and 10 to 20 minutes to embed.
 
 ## Connect Search Console (recommended)
 
@@ -152,7 +154,7 @@ sitefocus report --focus work/embed --plan work/plan --site example.com --out wo
 python -m unittest discover -s tests -v
 ```
 
-38 tests, offline: PageRank against an independent dense implementation, exact harmonic centrality against brute force, Search Console and backlink export parsing, link placement rules, and an end-to-end run against a local fixture site (robots.txt, sitemap-only orphan, redirects, 404, a page that rate-limits once, meta noindex, X-Robots-Tag, page-level nofollow, a JavaScript-only link) with a fake embedding server, and the Search Console connection against a fake Google API (credentials, property choice, pagination past 25,000 rows, scope checks). GitHub Actions runs them on Python 3.9 and 3.13.
+64 tests, offline: PageRank against an independent dense implementation, exact harmonic centrality against brute force, Search Console and backlink export parsing, link placement rules, and an end-to-end run against a local fixture site (robots.txt, sitemap-only orphan, redirects, 404, a page that rate-limits once, meta noindex, X-Robots-Tag, page-level nofollow, a JavaScript-only link) with a fake embedding server, and the Search Console connection against a fake Google API (credentials, property choice, pagination past 25,000 rows, scope checks), plus a regression test for every finding of an independent code review: hostile page titles, redirects off the site or into robots-blocked paths, robots.txt server errors, oversized pages, charsets, `<base href>`, damaged crawl files, cache staleness, nofollow modelling and CSV formula injection. GitHub Actions runs them on Python 3.9 and 3.13.
 
 ## Settings
 

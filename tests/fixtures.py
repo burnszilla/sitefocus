@@ -30,9 +30,12 @@ def page(title, body, links="", robots="", canonical="", root="/"):
 
 
 class Site:
-    def __init__(self):
+    def __init__(self, robots_status=200):
         self.flaky_hits = 0
         self.lock = threading.Lock()
+        self.requests = []  # (time, path)
+        self.robots_status = robots_status
+        self.offsite = None  # set to a URL on another server for the redirect test
 
     def routes(self, base):
         r = {}
@@ -52,10 +55,21 @@ class Site:
             robots = "nofollow" if i == 4 else ""
             if i == 4:
                 links = '<p><a href="/products/industrial/">industrial widgets</a></p>'
+            if i == 3:
+                links = "".join(f'<a href="/odd/{x}/">{x}</a> ' for x in ("xss", "formula", "inline", "latin1", "base", "big")) + '<a href="/go-blocked">b</a> <a href="/go-offsite">o</a>'
             r[f"/blog/{i}/"] = (200, "text/html", page(t, b, links, robots=robots, root=base), hdr)
         r["/old-widgets"] = (301, "text/html", "", {"Location": f"{base}/products/widgets/"})
         r["/search/"] = (200, "text/html", page("Search", "Search results.", robots="noindex", root=base), {})
         r["/js-only/"] = (200, "text/html", page("JS only", "Only linked from JavaScript.", root=base), {})
+        # Hostile and awkward pages, linked from /blog/3/.
+        r["/odd/xss/"] = (200, "text/html", page("&lt;img src=x onerror=alert(1)&gt;", "A page whose title is an HTML payload about garden widgets.", root=base), {})
+        r["/odd/formula/"] = (200, "text/html", page('=HYPERLINK("https://attacker.example/","Open")', "Formula title page about widget pricing.", root=base), {})
+        r["/odd/inline/"] = (200, "text/html", "<html><head><title>Inline</title></head><body><main><p>Compare our <strong>garden widgets</strong> before buying a replacement for your <a href=\"/products/widgets/\">garden widget pricing</a> page today.</p></main></body></html>", {})
+        r["/odd/latin1/"] = (200, "text/html; charset=windows-1252", None, {})
+        r["/odd/base/"] = (200, "text/html", '<html><head><base href="/blog/"><title>Base</title></head><body><a href="2/">Two</a></body></html>', {})
+        r["/odd/big/"] = (200, "text/html", "<html><head><title>Big</title></head><body><p>" + ("widget " * 1000000) + "</p></body></html>", {})
+        r["/go-blocked"] = (301, "text/html", "", {"Location": f"{base}/private/secret"})
+        r["/go-offsite"] = (301, "text/html", "", {"Location": self.offsite or "http://localhost:1/"})
         return r
 
     def server(self):
@@ -68,6 +82,13 @@ class Site:
             def do_GET(self):
                 base = f"http://127.0.0.1:{self.server.server_port}"
                 path = self.path.split("?")[0]
+                import time as _t
+                with site.lock:
+                    site.requests.append((_t.time(), path))
+                if path == "/robots.txt" and site.robots_status != 200:
+                    self.send_response(site.robots_status)
+                    self.end_headers()
+                    return
                 if path == "/flaky/":
                     with site.lock:
                         site.flaky_hits += 1
@@ -90,12 +111,16 @@ class Site:
                     self.wfile.write(b"<html><body>not found</body></html>")
                     return
                 code, ctype, body, hdr = rt
+                if body is None:  # windows-1252 page
+                    raw = "<html><head><title>Caf\u00e9 widgets</title></head><body><p>Caf\u00e9 garden widgets for every terrace.</p></body></html>".encode("cp1252")
+                else:
+                    raw = body.encode()
                 self.send_response(code)
-                self.send_header("Content-Type", ctype + ("; charset=utf-8" if "html" in ctype else ""))
+                self.send_header("Content-Type", ctype + ("; charset=utf-8" if "html" in ctype and "charset" not in ctype else ""))
                 for k, v in hdr.items():
                     self.send_header(k, v)
                 self.end_headers()
-                self.wfile.write(body.encode())
+                self.wfile.write(raw)
 
         srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
         threading.Thread(target=srv.serve_forever, daemon=True).start()

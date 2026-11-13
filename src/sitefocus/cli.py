@@ -96,13 +96,14 @@ def run(argv):
     ap.add_argument("--backlinks", help="backlink export (Search Console Top linked pages, Ahrefs or Semrush CSV)")
     ap.add_argument("--chunks", type=int, default=3, help="embedding windows per long page")
     ap.add_argument("--no-recheck", action="store_true", help="skip the live re-check of flagged link targets")
+    ap.add_argument("--fresh", action="store_true", help="recrawl from scratch (the previous crawl is kept in crawl/previous-<time>/); use after shipping changes")
     ap.add_argument("--anchor-model", help="optional local Ollama model for anchor suggestions, e.g. qwen3:8b")
     a = ap.parse_args(argv)
     w = lambda *p: os.path.join(a.out, *p)
     os.makedirs(a.out, exist_ok=True)
     if not a.gsc and not a.no_gsc:
         a.gsc = _gsc_for_run(a, w("gsc-pages.csv"))
-    crawl = ["--start", a.start, "--out", w("crawl"), "--max-pages", str(a.max_pages)]
+    crawl = ["--start", a.start, "--out", w("crawl"), "--max-pages", str(a.max_pages)] + (["--fresh"] if a.fresh else [])
     for s in a.sitemap:
         crawl += ["--sitemap", s]
     _run("site_crawl", crawl)

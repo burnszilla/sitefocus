@@ -53,12 +53,21 @@ from urllib.parse import urljoin, urlsplit
 import numpy as np
 
 
-def pagerank(n, src, dst, d=0.85, iters=100, w=None, tele=None):
+def pagerank(n, src, dst, d=0.85, iters=100, w=None, tele=None, sink=None):
     """Weighted, personalised PageRank. w: per-edge weights (link prominence);
-    tele: teleport vector (where external link equity lands), sums to 1."""
+    tele: teleport vector (where external link equity lands), sums to 1;
+    sink: per-page weight of nofollowed links. A nofollowed link takes its
+    share of the page's PageRank, and that share is discarded (Google's
+    behaviour since 2009), so it reduces what the other links pass."""
+    if n == 0:
+        return np.zeros(0)
+    src = np.asarray(src, dtype=np.int64)
+    dst = np.asarray(dst, dtype=np.int64)
     w = np.ones(len(src)) if w is None else np.asarray(w, dtype=np.float64)
     tele = np.full(n, 1 / n) if tele is None else tele
-    outw = np.bincount(src, weights=w, minlength=n)
+    outw = np.bincount(src, weights=w, minlength=n).astype(np.float64)
+    if sink is not None:
+        outw = outw + sink
     pr = tele.copy()
     for _ in range(iters):
         new = np.zeros(n)
@@ -203,12 +212,15 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def recheck(urls, delay=0.5, limit=200):
+def recheck(urls, delay=0.5, limit=200, rp=None):
     """Fetch each URL once more, without following redirects. Returns
-    {url: (status, location)}; status 0 means the request failed."""
+    {url: (status, location)}; status 0 means the request failed. URLs that
+    robots.txt disallows are skipped."""
     opener = urllib.request.build_opener(_NoRedirect)
     out = {}
     for u in list(urls)[:limit]:
+        if rp is not None and not rp.can_fetch(_UA, u):
+            continue
         try:
             r = opener.open(urllib.request.Request(u, headers={"User-Agent": _UA}), timeout=20)
             out[u] = (r.status, "")
@@ -323,7 +335,47 @@ def llm_anchor(base, model, paragraph, target_title):
     return ""
 
 
+try:
+    from .common import read_pages, safe_cell
+    from . import site_crawl as _crawl
+except ImportError:
+    from common import read_pages, safe_cell
+    import site_crawl as _crawl
+
+
 GENERIC_ANCHOR = re.compile(r"^(learn more|read more|more|click here|here|see more|details|get started|start for free|start free|this|link|view|see details|find out more|continue|go)$", re.I)
+
+
+def traffic_whatif(impr, clicks, pos, pr_before, pr_after, min_gain=1.05):
+    """Gross click opportunity if the pages whose internal PageRank rises by
+    at least 5% gain 1, 2 or 3 positions. Uses this site's own CTR curve
+    (rounded positions 1 to 20, at least 3 pages with 20+ impressions each,
+    forced non-increasing) and applies the change in expected CTR between the
+    current and the improved position. Not a forecast and not net of losses."""
+    impr, clicks, pos = np.asarray(impr, float), np.asarray(clicks, float), np.asarray(pos, float)
+    ok = (impr >= 20) & (pos > 0)
+    buckets = {}
+    for b in range(1, 21):
+        m = ok & (np.round(pos) == b)
+        if m.sum() >= 3:
+            buckets[b] = float(clicks[m].sum() / impr[m].sum())
+    if len(buckets) < 6 or (1 not in buckets and 2 not in buckets):
+        return {"available": False, "reason": f"not enough Search Console data to build this site's CTR curve ({len(buckets)} usable positions; need 6 including position 1 or 2)"}
+    xs = sorted(buckets)
+    ys = [buckets[x] for x in xs]
+    for i in range(1, len(ys)):
+        ys[i] = min(ys[i], ys[i - 1])
+
+    def ctr(p_):
+        return float(np.interp(min(max(p_, xs[0]), xs[-1]), xs, ys))
+    gainers = [i for i in range(len(impr)) if pr_after[i] >= min_gain * pr_before[i]]
+    cand = [i for i in gainers if impr[i] > 0 and 1.5 < pos[i] <= 30]
+    out = {"available": True, "pages": len(cand), "impressions": float(impr[cand].sum()) if cand else 0.0,
+           "clicks_now": float(clicks[cand].sum()) if cand else 0.0, "curve": {str(x): round(y, 4) for x, y in zip(xs, ys)},
+           "kind": "gross opportunity, not net effect"}
+    for g in (1, 2, 3):
+        out[f"gain_{g}"] = round(sum(impr[i] * max(ctr(max(1.0, pos[i] - g)) - ctr(pos[i]), 0.0) for i in cand))
+    return out
 
 
 def main():
@@ -357,10 +409,12 @@ def main():
     vec = dict(zip(keys, V))
     F = json.load(open(os.path.join(a.focus, "focus.json")))
 
-    redirect, host = {}, None
-    for line in open(os.path.join(a.crawl, "pages.jsonl")):
-        r = json.loads(line)
-        host = host or urlsplit(r["url"]).hostname
+    crawl_pages = read_pages(os.path.join(a.crawl, "pages.jsonl"))
+    meta_path = os.path.join(a.crawl, "meta.json")
+    cmeta = json.load(open(meta_path)) if os.path.exists(meta_path) else {}
+    host = cmeta.get("origin_host") or (urlsplit(crawl_pages[0].get("final") or crawl_pages[0]["url"]).hostname if crawl_pages else None)
+    redirect = {}
+    for r in crawl_pages:
         if r.get("final"):
             f_ = r["final"].split("#")[0]
             redirect[r["url"]] = f_ + "/" if f_.count("/") == 2 else f_
@@ -373,18 +427,20 @@ def main():
     ix = {u: i for i, u in enumerate(nodes)}
     info = {p["url"]: p for p in fp}
     n = len(nodes)
+    if n == 0:
+        raise SystemExit(f"no indexable pages on {host} in the crawl; nothing to plan")
     Vn = np.array([vec[u] for u in nodes])
     secs = [section_of(u) for u in nodes]
 
     status, finals, crawled = {}, {}, set()
-    for line in open(os.path.join(a.crawl, "pages.jsonl")):
-        r = json.loads(line)
+    for r in crawl_pages:
         crawled.add(r["url"])
         status[r["url"]] = r.get("status") or ("error" if r.get("error") else None)
         finals[r["url"]] = (r.get("final") or r["url"]).split("#")[0]
     nonindex = {p["url"] for p in fp if not p["indexable"]}
 
     pairs, body_pairs, leaked = set(), set(), 0
+    nf_pairs = {}  # (s, t) -> weight of nofollowed links, page-level or link-level
     anchors = defaultdict(Counter)
     hyg = {"to_redirect": Counter(), "to_broken": Counter(), "to_nonindexable": Counter(), "to_uncrawled": Counter(),
            "rate_limited": Counter(), "nofollow": Counter(), "account": Counter(), "page_nofollow": Counter()}
@@ -396,9 +452,9 @@ def main():
         t = redirect.get(raw_t, raw_t)
         if s not in ix:
             continue
-        if info.get(s, {}).get("nofollow_page"):
+        page_nf = bool(info.get(s, {}).get("nofollow_page"))
+        if page_nf:
             hyg["page_nofollow"][s] += 1
-            continue
         if r.get("nofollow") == "1":
             hyg["nofollow"][raw_t] += 1
         if acct.search(raw_t.split("://", 1)[-1]):
@@ -417,7 +473,10 @@ def main():
         if t in nonindex and t != s:
             hyg["to_nonindexable"][t] += 1
         if t in ix:
-            if s != t:
+            if s != t and (page_nf or r.get("nofollow") == "1"):
+                k_ = (ix[s], ix[t])
+                nf_pairs[k_] = max(nf_pairs.get(k_, 0.0), 1.0 if r["zone"] == "body" else a.template_weight)
+            elif s != t:
                 pairs.add((ix[s], ix[t]))
                 if r["zone"] == "body":
                     body_pairs.add((ix[s], ix[t]))
@@ -431,7 +490,14 @@ def main():
         todo = set(hyg["to_redirect"]) | set(hyg["to_broken"]) | set(hyg["rate_limited"])
         if todo:
             print(f"rechecking {len(todo)} link targets live", flush=True)
-            live = recheck(sorted(todo, key=lambda u: -(hyg["to_redirect"][u] + hyg["to_broken"][u] + hyg["rate_limited"][u])))
+            try:
+                rp_, _, cd_ = _crawl.load_robots(cmeta.get("start_final") or f"https://{host}/", _crawl.Gate(0.5))
+            except SystemExit as ex:
+                rp_ = None
+                print(f"recheck skipped: {ex}", flush=True)
+            if rp_ is not None:
+                live = recheck(sorted(todo, key=lambda u: -(hyg["to_redirect"][u] + hyg["to_broken"][u] + hyg["rate_limited"][u])),
+                               delay=max(0.5, float(cd_ or 0)), rp=rp_)
         for u, (st_, loc) in live.items():
             c = hyg["to_redirect"].pop(u, 0) + hyg["to_broken"].pop(u, 0) + hyg["rate_limited"].pop(u, 0)
             if 300 <= st_ < 400:
@@ -457,11 +523,25 @@ def main():
     else:
         tele = None
 
+    sink = np.zeros(n)
+    for (s_, t_), w_ in nf_pairs.items():
+        if (s_, t_) not in pairs:
+            sink[s_] += w_
+    nfp = {ix[u] for u in nodes if info[u].get("nofollow_page")}
+
     def pr_of(e, tpl=None):
         tpl = template_pairs if tpl is None else tpl
         e = list(e)
         w = [a.template_weight if p_ in tpl else 1.0 for p_ in e]
-        return pagerank(n, np.array([p_[0] for p_ in e]), np.array([p_[1] for p_ in e]), w=w, tele=tele)
+        return pagerank(n, np.array([p_[0] for p_ in e], dtype=np.int64), np.array([p_[1] for p_ in e], dtype=np.int64),
+                        w=w, tele=tele, sink=sink)
+    priority = []
+    for u in open(a.priority):
+        u = redirect.get(u.strip(), u.strip())
+        if u in ix and ix[u] not in priority:
+            priority.append(ix[u])
+    if not priority:
+        raise SystemExit("none of the priority URLs were crawled as indexable pages; check priority.txt")
 
     pr = pr_of(pairs)
     linking, existing = defaultdict(set), defaultdict(set)
@@ -471,13 +551,6 @@ def main():
     existing_orig = {k: set(v) for k, v in existing.items()}
     existing_orig = defaultdict(set, existing_orig)
 
-    priority = []
-    for u in open(a.priority):
-        u = redirect.get(u.strip(), u.strip())
-        if u in ix and ix[u] not in priority:
-            priority.append(ix[u])
-    if not priority:
-        raise SystemExit("none of the priority URLs were crawled as indexable pages; check priority.txt")
     pset = set(priority)
     anchor = Vn[priority].mean(0)
     anchor /= np.linalg.norm(anchor)
@@ -499,7 +572,7 @@ def main():
         thr, protected, near_win = 0, np.zeros(n, bool), np.zeros(n, bool)
 
     def lfs(p):
-        return float((p * topic).sum() / p.sum())
+        return float((p * topic).sum() / p.sum()) if p.sum() > 0 else 0.0
 
     def quadrants(p):
         lk = pctile(p)
@@ -509,14 +582,38 @@ def main():
     q0 = quadrants(pr)
     links0 = pctile(pr)
 
+    def blocked_pairs(idx_s, thr, keep=200, block=2000):
+        """Pairs (sim, i, j), i < j, with cosine >= thr, computed in row blocks
+        so memory stays bounded on large sections. Returns (has_any, top pairs)."""
+        import heapq
+        X = Vn[idx_s]
+        has = np.zeros(len(idx_s), bool)
+        top = []
+        for b0 in range(0, len(idx_s), block):
+            M = X[b0:b0 + block] @ X.T
+            for r_ in range(M.shape[0]):
+                M[r_, b0 + r_] = 0
+            hit = M >= thr
+            has[b0:b0 + block] |= hit.any(1)
+            if keep <= 0:
+                continue
+            rows, cols = np.nonzero(hit)
+            for r_, c_ in zip(rows, cols):
+                gi = b0 + r_
+                if c_ > gi:
+                    item = (float(M[r_, c_]), idx_s[gi], idx_s[c_])
+                    if len(top) < keep:
+                        heapq.heappush(top, item)
+                    elif item[0] > top[0][0]:
+                        heapq.heapreplace(top, item)
+        return has, sorted(top, reverse=True)
+
     near_dups = {}
     for s in set(secs):
         idx_s = [i for i, x in enumerate(secs) if x == s]
         if len(idx_s) < 20:
             continue
-        M = Vn[idx_s] @ Vn[idx_s].T
-        np.fill_diagonal(M, 0)
-        has = (M >= a.near_dup).any(1)
+        has, _ = blocked_pairs(idx_s, a.near_dup, keep=0)
         near_dups[s] = {"pages": len(idx_s), "with_near_duplicate": int(has.sum()), "share": round(float(has.mean()), 3)}
 
     # Plan.
@@ -524,7 +621,7 @@ def main():
     adds, new_in, per_src = [], Counter(), Counter()
 
     def add(s_, t_, sm, why, cap=True):
-        if s_ == t_ or t_ in existing[s_] or new_in[t_] >= a.max_new_inlinks:
+        if s_ == t_ or s_ in nfp or t_ in existing[s_] or new_in[t_] >= a.max_new_inlinks:
             return False
         if cap and per_src[s_] >= a.adds_per_page:
             return False
@@ -551,15 +648,6 @@ def main():
             if got >= 8:
                 break
 
-    P = Vn[priority]
-    for s_ in np.argsort(-pr):
-        if s_ in pset or topic[s_] < 50:
-            continue
-        sims = P @ Vn[s_]
-        for j in np.argsort(-sims)[:3]:
-            if a.min_sim <= sims[j] < a.near_dup and add(int(s_), priority[j], float(sims[j]), "priority"):
-                break
-
     nw = [i for i in np.where(near_win)[0] if i not in pset]
     if nw:
         T = Vn[nw]
@@ -570,6 +658,15 @@ def main():
             for j in np.argsort(-sw)[:5]:
                 if a.min_sim <= sw[j] < a.near_dup and add(int(s_), nw[j], float(sw[j]), "near win"):
                     break
+
+    P = Vn[priority]
+    for s_ in np.argsort(-pr):
+        if s_ in pset or topic[s_] < 50:
+            continue
+        sims = P @ Vn[s_]
+        for j in np.argsort(-sims)[:3]:
+            if a.min_sim <= sims[j] < a.near_dup and add(int(s_), priority[j], float(sims[j]), "priority"):
+                break
 
     targets = [i for i in range(n) if topic[i] >= 75 and links0[i] < 50 and i not in pset]
     if targets:
@@ -603,17 +700,21 @@ def main():
     swap_out = [t for t in sitewide if t not in pset and flag(t) and not protected[t]][: len(orphans)]
     swap_in = orphans[: len(swap_out)]
 
-    moved_tpl = set()
-
-    def with_swap(e):
-        e = set(e)
-        for old, new in zip(swap_out, swap_in):
+    def reassign(e, outs, ins):
+        """Move template (non-body) links from each old target to its new
+        target. Returns the new edge set and the moved edges, which keep their
+        template weight. Body links that already existed keep body weight."""
+        e, moved = set(e), set()
+        for old, new in zip(outs, ins):
             for s_ in [s_ for s_, t_ in e if t_ == old and (s_, t_) not in body_pairs]:
                 e.discard((s_, old))
-                if s_ != new:
+                if s_ != new and (s_, new) not in e:
                     e.add((s_, new))
-                    moved_tpl.add((s_, new))
-        return e
+                    moved.add((s_, new))
+        return e, moved
+
+    def with_swap(e):
+        return reassign(e, swap_out, swap_in)
 
     e_adds = pairs | {(s_, t_) for s_, t_, _, _ in adds}
     pr_a = pr_of(e_adds)
@@ -621,34 +722,29 @@ def main():
     hca = harmonic(n, [p_[0] for p_ in e_adds], [p_[1] for p_ in e_adds])
     reach0 = pctile(hc0)
     reach_gap = reach0 - links0  # negative: PageRank runs ahead of reach (fed by a few strong links)
-    e_swap = with_swap(e_adds)
-    pr_b = pr_of(e_swap, template_pairs | moved_tpl)
+    e_swap, mv_swap = with_swap(e_adds)
+    pr_b = pr_of(e_swap, template_pairs | mv_swap)
     q_a, q_b = quadrants(pr_a), quadrants(pr_b)
 
-    # Scenarios: what actually moves the score.
-    def reassign(e, outs, ins):
-        e = set(e)
-        for old, new in zip(outs, ins):
-            for s_ in [s_ for s_, t_ in e if t_ == old and (s_, t_) not in body_pairs]:
-                e.discard((s_, old))
-                if s_ != new:
-                    e.add((s_, new))
-                    moved_tpl.add((s_, new))
-        return e
+    # Scenarios: what actually moves the score. Each builds its own edge set.
 
     weakest = sorted(priority, key=lambda i: pr_a[i])
     depth = lambda t: len([x for x in urlsplit(nodes[t]).path.split("/") if x])
     content_slots = [t for t in sitewide if t not in pset and t not in swap_out and depth(t) >= 2 and not protected[t]][: a.slots]
     slot_in = [p_ for p_ in weakest if p_ not in sitewide_set and p_ not in swap_in][: len(content_slots)]  # moving a slot to a page already linked sitewide changes nothing
     content_slots = content_slots[: len(slot_in)]
-    e_slots = reassign(e_adds, content_slots, slot_in)
+    e_slots, mv_slots = reassign(e_adds, content_slots, slot_in)
     msec = a.module_section or next((x["group"] for x in F["sections"] if x["group"] not in big_secs and x["pages"] >= 50), None)
-    e_mod = set(e_adds)
+    e_mod, mod_pairs = set(e_adds), set()
     if msec:
-        for i in [i for i, x in enumerate(secs) if x == msec]:
-            for j in np.argsort(-(P @ Vn[i]))[:3]:
-                e_mod.add((i, priority[j]))
-    pr_s, pr_m = pr_of(e_slots, template_pairs | moved_tpl), pr_of(e_mod)
+        for i in [i for i, x in enumerate(secs) if x == msec and i not in nfp]:
+            picks = [priority[j] for j in np.argsort(-(P @ Vn[i])) if priority[j] != i][:3]
+            for t_ in picks:
+                if (i, t_) not in e_mod:
+                    e_mod.add((i, t_))
+                    mod_pairs.add((i, t_))  # a template module: template weight
+    pr_s = pr_of(e_slots, template_pairs | mv_slots)
+    pr_m = pr_of(e_mod, template_pairs | mod_pairs)
     pri_ = np.array(priority)
     scen = [
         {"name": "Now", "lfs": lfs(pr), "priority": float(pr[pri_].sum()), "changes": "", "caveat": ""},
@@ -664,43 +760,15 @@ def main():
          "caveat": ("pages with the most clicks are excluded" if has_gsc else "check traffic first: these slots may hold pages that earn clicks (add --gsc)")},
     ]
     def traffic_scenario():
-        """Clicks if the pages the plan strengthens gain 1, 2 or 3 positions,
-        using this site's own CTR-by-position curve from the GSC export. A
-        what-if range, not a forecast; None when the data cannot support it."""
         if not has_gsc:
             return {"available": False, "reason": "no Search Console export (--gsc)"}
-        ok = (impr >= 20) & (pos > 0)
-        buckets = {}
-        for b in range(1, 21):
-            m = ok & (np.round(pos) == b)
-            if m.sum() >= 3:
-                buckets[b] = float(clicks[m].sum() / impr[m].sum())
-        if len(buckets) < 6 or 1 not in buckets and 2 not in buckets:
-            return {"available": False, "reason": f"not enough Search Console data to build this site's CTR curve ({len(buckets)} usable positions; need 6 including position 1 or 2)"}
-        xs = sorted(buckets)
-        ys = [buckets[x] for x in xs]
-        for i in range(1, len(ys)):  # CTR should not rise as position worsens
-            ys[i] = min(ys[i], ys[i - 1])
-
-        def ctr(p_):
-            p_ = min(max(p_, xs[0]), xs[-1])
-            return float(np.interp(p_, xs, ys))
-        strengthened = set(t for _, t, _, _ in adds) | set(slot_in) | set(swap_in) | set(priority)
-        cand = [i for i in strengthened if impr[i] > 0 and 1.5 < pos[i] <= 30]
-        out = {"available": True, "pages": len(cand), "impressions": float(impr[cand].sum()) if cand else 0.0,
-               "clicks_now": float(clicks[cand].sum()) if cand else 0.0, "curve": {str(x): round(y, 4) for x, y in zip(xs, ys)}}
-        for g in (1, 2, 3):
-            gain = 0.0
-            for i in cand:
-                gain += max(impr[i] * ctr(max(1.0, pos[i] - g)) - clicks[i], 0.0)
-            out[f"gain_{g}"] = round(gain)
-        return out
+        return traffic_whatif(impr, clicks, pos, pr, pr_all)
 
     # Every recommended change at once: contextual links, the module, the
     # flagged swap and the sitewide content slots.
-    moved_tpl.clear()
-    e_all = reassign(with_swap(e_mod), content_slots, slot_in)
-    pr_all = pr_of(e_all, template_pairs | moved_tpl)
+    e_tmp, mv_a = with_swap(e_mod)
+    e_all, mv_b = reassign(e_tmp, content_slots, slot_in)
+    pr_all = pr_of(e_all, template_pairs | mod_pairs | mv_a | mv_b)
     hc_all = harmonic(n, [p_[0] for p_ in e_all], [p_[1] for p_ in e_all])
     link_all = defaultdict(set)
     for s_, t_ in e_all:
@@ -759,12 +827,7 @@ def main():
         idx_s = [i for i, x in enumerate(secs) if x == sname]
         if len(idx_s) < 2:
             continue
-        M = Vn[idx_s] @ Vn[idx_s].T
-        iu = np.triu_indices(len(idx_s), 1)
-        hit = np.where(M[iu] >= 0.95)[0]
-        for h in hit[np.argsort(-M[iu][hit])][:200]:
-            i, j = idx_s[iu[0][h]], idx_s[iu[1][h]]
-            cannibal.append((float(M[iu][h]), i, j))
+        cannibal += blocked_pairs(idx_s, 0.95, keep=200)[1]
     cannibal.sort(key=lambda x: -x[0])
 
     qnames = ["star", "underlinked", "leak", "long tail"]
@@ -799,6 +862,8 @@ def main():
                              "linking_pages": len(linking[i])} for i in np.argsort(-reach_gap)[:20] if reach_gap[i] >= 25],
         },
         "scenarios": scen,
+        "nofollow_model": {"nofollow_pairs": len([k for k in nf_pairs if k not in pairs]), "nofollow_pages": len(nfp)},
+        "phases": ["orphan", "near win", "priority", "underlinked"],
         "impact": impact,
         "model": {"template_weight": a.template_weight, "template_links": len(template_pairs), "backlinks": bool(backlinks),
                   "backlink_pages": int((ext > 0).sum()) if backlinks else 0},
@@ -837,13 +902,12 @@ def main():
             w.writerow([nodes[i], secs[i], round(float(topic[i]), 1), round(float(links0[i]), 1), round(float(la[i]), 1),
                         round(float(reach0[i]), 1), round(float(reach_gap[i]), 1), g, int(i in pset), len(linking[i]),
                         int(depth_of[i]) if depth_of[i] >= 0 else "", f"{pr[i]:.3e}", f"{pr_a[i]:.3e}", int(ext[i]) if backlinks else "", int(clicks[i]), int(impr[i]), round(float(pos[i]), 1) if pos[i] else "",
-                        int(protected[i]), int(near_win[i]), info[nodes[i]]["title"]])
+                        int(protected[i]), int(near_win[i]), safe_cell(info[nodes[i]]["title"])])
     # Where each new link goes: the paragraph on the source page that best
     # matches the target, and an anchor phrase already in that paragraph.
     need = {nodes[s_] for s_, _, _, _ in adds}
     texts, df = {}, Counter()
-    for line in open(os.path.join(a.crawl, "pages.jsonl")):
-        r = json.loads(line)
+    for r in crawl_pages:
         if not r.get("text"):
             continue
         f_ = redirect.get(r["url"], r["url"])
@@ -854,8 +918,7 @@ def main():
     npages = max(len(fp), 1)
     cutoff = max(20, 0.15 * npages)
     gdf, ndocs = Counter(), 0
-    for line in open(os.path.join(a.crawl, "pages.jsonl")):
-        r = json.loads(line)
+    for r in crawl_pages:
         if r.get("text"):
             ndocs += 1
             gdf.update(set(t for b in r["text"].split("\n") if b.strip() and df[b.strip()] <= cutoff for t in _tokens(b)))
@@ -893,14 +956,14 @@ def main():
         order = {"orphan: parent hub": 0, "orphan: similar page": 1, "priority": 2, "near win": 3, "underlinked": 4}
         for s_, t_, sm, why in sorted(adds, key=lambda x: (order[x[3]], -x[2])):
             an, it, pa, how = instr[(s_, t_)]
-            w.writerow([nodes[s_], nodes[t_], round(sm, 3), why, an, it, pa, how])
+            w.writerow([nodes[s_], nodes[t_], round(sm, 3), why, safe_cell(an), it, safe_cell(pa), safe_cell(how)])
     with open(os.path.join(a.out, "sitewide.csv"), "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["target", "section", "linked_from_pages", "topic", "pagerank_share", "flag", "swap", "slot_scenario", "clicks", "protected", "title"])
         for t in sitewide:
             w.writerow([nodes[t], secs[t], indeg[t], round(float(topic[t]), 1), f"{pr[t]:.4f}",
                         flag(t) or ("leak" if topic[t] < 25 else ""), int(t in swap_out), int(t in content_slots),
-                        int(clicks[t]) if has_gsc else "", int(protected[t]) if has_gsc else "", info[nodes[t]]["title"]])
+                        int(clicks[t]) if has_gsc else "", int(protected[t]) if has_gsc else "", safe_cell(info[nodes[t]]["title"])])
     with open(os.path.join(a.out, "hygiene.csv"), "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["issue", "target", "links_to_it", "points_to", "status", "rechecked_live"])
